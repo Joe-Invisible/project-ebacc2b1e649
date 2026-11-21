@@ -36,11 +36,11 @@ native-profiled:
 	work=$$(mktemp -d); \
 	staged=; \
 	trap 'rm -rf "$$work"; if [ -n "$$staged" ]; then rm -f "$$staged"; fi' EXIT; \
-	$(CXX) $(NATIVE_FLAGS) -DSHOPPING_PGO_TRAINING -fprofile-generate="$$work/profile" \
+	$(CXX) $(NATIVE_FLAGS) -fprofile-generate="$$work/profile" \
 	    -fprofile-update=atomic pipeline/native.cpp -Wl,-l:liblz4.so.1 -o "$$work/native_pipeline"; \
 	for dataset in "$(PGO_DATA)" "$(PGO_EXTRA_DATA)"; do \
 	    if [ -n "$$dataset" ]; then \
-	        DATA_DIR="$$dataset" OUTPUT_DIR="$$work/output" NCPU="$(CPUS)" "$$work/native_pipeline"; \
+	        SHOPPING_PGO_TRAINING=1 DATA_DIR="$$dataset" OUTPUT_DIR="$$work/output" NCPU="$(CPUS)" "$$work/native_pipeline"; \
 	    fi; \
 	done; \
 	$(CXX) $(NATIVE_FLAGS) -fprofile-use="$$work/profile" -fprofile-correction \

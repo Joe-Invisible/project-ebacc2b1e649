@@ -1036,13 +1036,11 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     }
     // The writers have closed their files and joined. Let the kernel reclaim
     // the remaining in-memory result buffers in this one-shot executable.
-#ifdef SHOPPING_PGO_TRAINING
-    // GCC writes its profile through an exit handler.
-    std::exit(0);
-#else
+    // A profiling build writes its profile through an exit handler. The check
+    // is at run time so training and release builds share control flow.
+    if (std::getenv("SHOPPING_PGO_TRAINING")) std::exit(0);
     if (sampler_dump) sampler_dump();
     std::_Exit(0);
-#endif
 }
 } // namespace shopping
 
