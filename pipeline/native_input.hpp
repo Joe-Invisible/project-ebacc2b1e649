@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -276,6 +277,123 @@ public:
     }
     ~MappedInput() {
         for (auto part : mappings) munmap(const_cast<char*>(part.first), part.end - part.first);
+    }
+};
+
+// Reads CSV files in fixed-size chunks with pread into a caller-owned buffer
+// that stays cache resident. Unlike a file mapping, this needs no page-table
+// setup for the input and nothing to tear down afterwards.
+class ChunkedInput {
+    struct Chunk {
+        int file;
+        uint64_t offset, size, file_size;
+    };
+    std::vector<int> files;
+    static constexpr size_t slack = 64 * 1024;
+
+    static void read_exactly(int file, char* data, size_t size, uint64_t offset) {
+        while (size) {
+            const auto count = pread(file, data, size, static_cast<off_t>(offset));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) throw std::runtime_error("cannot read input");
+            data += count;
+            size -= static_cast<size_t>(count);
+            offset += static_cast<uint64_t>(count);
+        }
+    }
+
+public:
+    std::vector<Chunk> chunks;
+    ChunkedInput() = default;
+    ChunkedInput(const ChunkedInput&) = delete;
+    ~ChunkedInput() {
+        for (int file : files) close(file);
+    }
+
+    void add(const fs::path& path, size_t chunk_bytes) {
+        int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (file < 0) throw std::runtime_error("cannot open " + path.string());
+        struct stat info {};
+        if (fstat(file, &info) != 0) {
+            close(file);
+            throw std::runtime_error("cannot stat " + path.string());
+        }
+        const auto size = static_cast<uint64_t>(info.st_size);
+        if (!size) {
+            close(file);
+            return;
+        }
+        files.push_back(file);
+        for (uint64_t offset = 0; offset < size; offset += chunk_bytes) {
+            chunks.push_back({file, offset, std::min<uint64_t>(chunk_bytes, size - offset), size});
+        }
+    }
+
+    void folder(const fs::path& path, size_t chunk_bytes) {
+        if (!fs::exists(path)) return;
+        for (auto& entry : fs::directory_iterator(path)) {
+            if (entry.is_regular_file() && entry.path().filename().native().ends_with(".csv")) {
+                add(entry.path(), chunk_bytes);
+            }
+        }
+    }
+
+    size_t bytes() const {
+        size_t total = 0;
+        for (const auto& chunk : chunks) total += chunk.size;
+        return total;
+    }
+
+    // Loads a chunk plus enough of the following bytes to finish its last
+    // row. The returned part still needs row alignment, as a mapped one does.
+    Part load(size_t index, std::vector<char>& buffer) const {
+        const auto& chunk = chunks[index];
+        const auto available = chunk.file_size - chunk.offset;
+        size_t want = std::min<uint64_t>(chunk.size + slack, available);
+        for (;;) {
+            if (buffer.size() < want) buffer.resize(want);
+            read_exactly(chunk.file, buffer.data(), want, chunk.offset);
+            const char* data = buffer.data();
+            const char* part_end = data + chunk.size;
+            const char* file_end = data + want;
+            if (want == available || std::memchr(part_end, '\n', file_end - part_end)) {
+                return {data, part_end, file_end};
+            }
+            // The last row continues past the slack. Read further.
+            want = std::min<uint64_t>(want * 2, available);
+        }
+    }
+
+    // Estimates the row count from samples of evenly spaced chunks.
+    size_t estimate_rows(size_t minimum_width) const {
+        if (chunks.empty()) return 0;
+        std::vector<char> buffer;
+        size_t sampled_bytes = 0, sampled_rows = 0;
+        const size_t interval = std::max<size_t>(1, chunks.size() / 16);
+        for (size_t i = 0; i < chunks.size(); i += interval) {
+            const auto& chunk = chunks[i];
+            const size_t size = std::min<uint64_t>(16 * 1024, chunk.file_size - chunk.offset);
+            buffer.resize(size);
+            read_exactly(chunk.file, buffer.data(), size, chunk.offset);
+            const char* first = buffer.data();
+            const char* end = first + size;
+            const char* line = static_cast<const char*>(std::memchr(first, '\n', size));
+            if (!line) continue;
+            const char* row = ++line;
+            for (size_t n = 0; n < 128 && line < end; ++n) {
+                auto next = static_cast<const char*>(std::memchr(line, '\n', end - line));
+                if (!next) break;
+                line = next + 1;
+                ++sampled_rows;
+            }
+            sampled_bytes += line - row;
+        }
+        if (!sampled_rows) return 0;
+        // Sampled density controls capacity only. Malformed short rows do not
+        // inflate the reservation beyond the minimum possible row width.
+        const auto average = std::max(static_cast<double>(minimum_width),
+                                      static_cast<double>(sampled_bytes) / sampled_rows);
+        return static_cast<size_t>(bytes() / average);
     }
 };
 

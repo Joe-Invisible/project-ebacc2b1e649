@@ -21,6 +21,8 @@ constexpr uint32_t session_gap = 1800000;
 constexpr size_t event_bucket_count = 256;
 constexpr size_t person_bucket_count = 512;
 constexpr size_t input_chunk = 2 * 1024 * 1024;
+// Event and click files are read in chunks that stay in the L2 cache.
+constexpr size_t read_chunk = 256 * 1024;
 constexpr uint32_t invalid_event = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t missing_campaign = std::numeric_limits<uint32_t>::max();
 constexpr uint64_t price_mask = (uint64_t{1} << 24) - 1;
@@ -395,13 +397,13 @@ size_t estimate_event_count(const MappedInput& mapped) {
     return static_cast<size_t>(bytes / average);
 }
 
-void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64_t end,
+void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end,
                  Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads,
                  Arena& arena, Arena& payload_arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
-    const auto rows_per_worker = estimate_event_count(mapped) / workers;
+    const auto rows_per_worker = mapped.estimate_rows(27) / workers;
     const auto reserved = rows_per_worker + rows_per_worker / 8;
-    const auto readers = std::min(workers, mapped.parts.size());
+    const auto readers = std::min(workers, mapped.chunks.size());
     const bool reserve = reserved >= 256 * person_bucket_count;
     const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
     const auto payload_slot = (reserved / person_bucket_count + 3) & ~size_t{3};
@@ -439,8 +441,9 @@ void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64
                     bucket.reserve(payload_slot);
                 }
             }
-            for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
-                read_part<7>(mapped.parts[part], [&](const auto& fields) {
+            std::vector<char> buffer;
+            for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
+                read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
                     const auto id_hash = hash_key(keys.encode(fields[0]));
                     if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
                     const auto ingest = ingest_seconds(fields[3]);
@@ -470,7 +473,7 @@ void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64
             for (auto& bucket : payloads.rows[worker]) bucket.flush_tail();
 #endif
         } catch (...) {
-            next_part.store(mapped.parts.size(), std::memory_order_relaxed);
+            next_part.store(mapped.chunks.size(), std::memory_order_relaxed);
             throw;
         }
     });
@@ -528,12 +531,12 @@ void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayload
 }
 
 // Rows reserved for each worker's click bucket.
-size_t click_slot(const MappedInput& mapped, size_t workers) {
-    const auto per_bucket = estimate_event_count(mapped) / workers / person_bucket_count;
+size_t click_slot(const ChunkedInput& mapped, size_t workers) {
+    const auto per_bucket = mapped.estimate_rows(27) / workers / person_bucket_count;
     return (per_bucket + per_bucket / 4 + 1) & ~size_t{1};
 }
 
-void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
+void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
                  const Dimensions& dims, std::vector<RawClickRows>& output, Arena& arena,
                  std::atomic<size_t>& next, size_t worker_offset) {
     // Growing the per-bucket buffers would copy rows and touch extra pages.
@@ -557,8 +560,9 @@ void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64
                 bucket.reserve(reserved);
             }
         }
-        for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
-            read_part<4>(mapped.parts[part], [&](const auto& fields) {
+        std::vector<char> buffer;
+        for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
+            read_part<4>(mapped.load(part, buffer), [&](const auto& fields) {
                 if (fields[1].empty() || fields[2].empty()) return;
                 auto ts = timestamp_ms(fields[3]);
                 if (!ts || *ts < start - week_ms || *ts >= end) return;
@@ -977,10 +981,9 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     Arena arena, payload_arena, click_arena;
     std::vector<RawClickRows> clicks(workers);
     {
-        auto inputs = std::make_unique<std::array<MappedInput, 2>>();
-        auto& [event_input, click_input] = *inputs;
-        event_input.folder(input / "events", input_chunk);
-        click_input.folder(input / "clicks", input_chunk);
+        ChunkedInput event_input, click_input;
+        event_input.folder(input / "events", read_chunk);
+        click_input.folder(input / "clicks", read_chunk);
         std::vector<EventBuckets> events(workers);
         std::atomic<size_t> next_click{0};
         if (const auto slot = click_slot(click_input, workers); slot >= 64) {
@@ -1006,13 +1009,6 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
         mark("parse and link");
-        // A serial munmap of the inputs takes tens of milliseconds in the
-        // kernel. Dropping the pages in parallel leaves only empty mappings.
-        parallel(workers, workers, [&](size_t, size_t task) {
-            event_input.discard(task, workers);
-            click_input.discard(task, workers);
-        });
-        mark("drop inputs");
         deduplicate(events, workers, payloads);
         arena.reset();
         mark("event dedup");
