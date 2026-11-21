@@ -1,0 +1,3 @@
+ARG BASE_IMAGE=shopping-sessions:latest
+FROM ${BASE_IMAGE}
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple duckdb==2.0.0

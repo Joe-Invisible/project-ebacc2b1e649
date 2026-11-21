@@ -1,0 +1,7 @@
+/pipeline/normalize
+/pipeline/__pycache__/
+/experiments/__pycache__/
+/scripts/__pycache__/
+/dev/
+/dev-answer/
+/out/
