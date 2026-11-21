@@ -49,6 +49,7 @@ struct RawClick {
     Key id;
     uint32_t ts; // Offset from the beginning of the click window.
     uint32_t campaign;
+    uint64_t padding; // Two rows fill a cache line for streaming stores.
 };
 
 #ifdef __AVX2__
@@ -56,7 +57,7 @@ struct RawClick {
 template<class T>
 class EventBuffer {
     static constexpr size_t rows_per_line = 64 / sizeof(T);
-    static_assert(sizeof(T) == 16 && std::is_trivially_copyable_v<T>);
+    static_assert((sizeof(T) == 16 || sizeof(T) == 32) && std::is_trivially_copyable_v<T>);
 
     T* rows = nullptr;
     size_t used = 0, capacity = 0;
@@ -190,6 +191,7 @@ template<class T>
 using PersonBuckets = std::array<std::vector<T>, person_bucket_count>;
 using EventBuckets = std::array<EventBuffer<EventVersion>, event_bucket_count>;
 using RawEventRows = std::array<EventBuffer<RawEvent>, person_bucket_count>;
+using RawClickRows = std::array<EventBuffer<RawClick>, person_bucket_count>;
 
 template<class T>
 void release_event_buffer(EventBuffer<T>& buffer) {
@@ -525,16 +527,35 @@ void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayload
     });
 }
 
+// Rows reserved for each worker's click bucket.
+size_t click_slot(const MappedInput& mapped, size_t workers) {
+    const auto per_bucket = estimate_event_count(mapped) / workers / person_bucket_count;
+    return (per_bucket + per_bucket / 4 + 1) & ~size_t{1};
+}
+
 void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
-                 const Dimensions& dims, std::vector<PersonBuckets<RawClick>>& output,
+                 const Dimensions& dims, std::vector<RawClickRows>& output, Arena& arena,
                  std::atomic<size_t>& next, size_t worker_offset) {
-    // Growing the per-bucket vectors would copy rows and touch extra pages.
-    const auto per_bucket = estimate_event_count(mapped) / output.size() / person_bucket_count;
-    const auto reserved = per_bucket + per_bucket / 4;
+    // Growing the per-bucket buffers would copy rows and touch extra pages.
+    // The arena was sized in run() for every worker's buckets.
+    const auto reserved = click_slot(mapped, output.size());
     parallel(workers, workers, [&](size_t, size_t group) {
         const auto worker = worker_offset + group;
+#ifdef __AVX2__
+        struct WriteFence {
+            ~WriteFence() { _mm_sfence(); }
+        } fence_on_exit;
+#endif
         if (reserved >= 64) {
-            for (auto& bucket : output[worker]) bucket.reserve(reserved);
+            for (auto& bucket : output[worker]) {
+#ifdef __AVX2__
+                if (auto* memory = arena.allocate(reserved * sizeof(RawClick))) {
+                    bucket.attach(static_cast<RawClick*>(memory), reserved);
+                    continue;
+                }
+#endif
+                bucket.reserve(reserved);
+            }
         }
         for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
             read_part<4>(mapped.parts[part], [&](const auto& fields) {
@@ -546,9 +567,12 @@ void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64
                 const auto hash = hash_key(keys.encode(fields[1]));
                 const auto bucket = bucket_from_hash<person_bucket_count>(hash);
                 const auto offset = static_cast<uint32_t>(*ts - (start - week_ms));
-                output[worker][bucket].push_back({hash, keys.encode(fields[0]), offset, campaign});
+                output[worker][bucket].push_back({hash, keys.encode(fields[0]), offset, campaign, 0});
             });
         }
+#ifdef __AVX2__
+        for (auto& bucket : output[worker]) bucket.flush_tail();
+#endif
     });
 }
 
@@ -580,7 +604,7 @@ struct TimelineStorage {
 };
 using SpanPartitions = std::vector<PersonBuckets<TimelineSpan>>;
 
-void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawClick>>& clicks,
+void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clicks,
                         size_t workers, const PersonAliases& aliases,
                         TimelineStorage& storage, SpanPartitions& routed, Arena& arena) {
     parallel(workers, person_bucket_count, [&](size_t worker, size_t bucket) {
@@ -659,7 +683,7 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawCl
             for (const auto& click : feed[bucket]) {
                 click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id, click.ts, click.campaign};
             }
-            discard_memory(feed[bucket].data(), feed[bucket].capacity() * sizeof(RawClick));
+            release_event_buffer(feed[bucket]);
         }
     });
 }
@@ -950,8 +974,8 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     mark("dimensions");
     // Event-ID buckets keep all revisions together, even if their user IDs differ.
     EventPayloads payloads(workers);
-    Arena arena, payload_arena;
-    std::vector<PersonBuckets<RawClick>> clicks(workers);
+    Arena arena, payload_arena, click_arena;
+    std::vector<RawClickRows> clicks(workers);
     {
         auto inputs = std::make_unique<std::array<MappedInput, 2>>();
         auto& [event_input, click_input] = *inputs;
@@ -959,22 +983,25 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         click_input.folder(input / "clicks", input_chunk);
         std::vector<EventBuckets> events(workers);
         std::atomic<size_t> next_click{0};
+        if (const auto slot = click_slot(click_input, workers); slot >= 64) {
+            click_arena.reserve(workers * person_bucket_count * slot * sizeof(RawClick));
+        }
         if (workers == 1) {
             people = link_people(keys, input);
             read_events(event_input, 1, start, end, keys, dims, events, payloads, arena, payload_arena);
-            read_clicks(click_input, 1, start, end, keys, dims, clicks, next_click, 0);
+            read_clicks(click_input, 1, start, end, keys, dims, clicks, click_arena, next_click, 0);
         } else {
             std::exception_ptr link_or_click_error;
             std::jthread resolve([&] {
                 try {
                     people = link_people(keys, input);
-                    read_clicks(click_input, 1, start, end, keys, dims, clicks, next_click, 0);
+                    read_clicks(click_input, 1, start, end, keys, dims, clicks, click_arena, next_click, 0);
                 } catch (...) {
                     link_or_click_error = std::current_exception();
                 }
             });
             read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena, payload_arena);
-            read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, next_click, 1);
+            read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, click_arena, next_click, 1);
             resolve.join();
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
@@ -1023,6 +1050,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         if (bucket < workers) {
             arena.discard(bucket, workers);
             payload_arena.discard(bucket, workers);
+            click_arena.discard(bucket, workers);
         }
     });
     mark("release memory");
