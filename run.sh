@@ -5,4 +5,9 @@ set -eu
 export DATA_DIR OUTPUT_DIR SCRATCH_DIR
 # Read-only root filesystem: everything that wants a temp or home dir gets /scratch.
 export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
-exec python3 /app/pipeline/launch.py
+status=0
+/app/pipeline/native_pipeline || status=$?
+if [ "$status" -eq 10 ]; then
+    exec python3 /app/pipeline/launch.py
+fi
+exit "$status"

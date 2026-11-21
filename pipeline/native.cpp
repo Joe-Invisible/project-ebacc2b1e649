@@ -5,8 +5,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
-#include <future>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <span>
 #include <sys/resource.h>
 
@@ -14,46 +15,47 @@ namespace shopping {
 constexpr int64_t day_ms = 86400000;
 constexpr int64_t week_ms = 7 * day_ms;
 constexpr uint32_t session_gap = 1800000;
-constexpr size_t bucket_count = 128;
+constexpr size_t event_bucket_count = 256;
+constexpr size_t person_bucket_count = 512;
 constexpr size_t input_chunk = 2 * 1024 * 1024;
 constexpr uint32_t invalid_event = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t missing_campaign = std::numeric_limits<uint32_t>::max();
-constexpr int64_t ingest_bias = 62135596800; // Seconds between year 1 UTC and Unix epoch.
 constexpr uint64_t price_mask = (uint64_t{1} << 24) - 1;
 
 int32_t utc_day(int64_t value) {
     return value / day_ms - (value % day_ms < 0);
 }
 
-struct Event {
-    Key id;
-    Key user;
-    uint64_t ingest_and_price;
-    uint32_t ts;
-    uint32_t category;
+// Keep the hot deduplication stream compact. Valid payloads are stored
+// separately by raw user, and invalid versions can still win.
+struct EventVersion {
+    uint64_t id_hash;
+    uint32_t ingest;
+    uint32_t position;
 };
-struct SessionEvent {
-    Key person;
+static_assert(sizeof(EventVersion) == 16);
+constexpr uint32_t missing_payload = UINT32_MAX;
+struct WideEventLayout {};
+struct RawEvent {
+    uint64_t user_hash;
     uint32_t ts;
     uint32_t purchase; // Low 24 bits are price in cents, high 8 bits are category.
 };
-struct Click {
-    Key person;
+struct RawClick {
+    uint64_t user_hash;
     Key id;
     uint32_t ts; // Offset from the beginning of the click window.
     uint32_t campaign;
 };
 
 template<class T>
-using Buckets = std::array<std::vector<T>, bucket_count>;
+using PersonBuckets = std::array<std::vector<T>, person_bucket_count>;
+using EventBuckets = std::array<std::vector<EventVersion>, event_bucket_count>;
 
+template<size_t Count>
 size_t bucket_from_hash(uint64_t hash) {
-    static_assert(std::has_single_bit(bucket_count));
-    return hash >> (64 - std::bit_width(bucket_count - 1));
-}
-
-size_t bucket_for(Key key) {
-    return bucket_from_hash(hash_key(key));
+    static_assert(std::has_single_bit(Count));
+    return hash >> (64 - std::bit_width(Count - 1));
 }
 
 Lookup<Key> link_people(Keys& keys, const fs::path& input, size_t workers) {
@@ -173,110 +175,166 @@ uint32_t parse_price(std::string_view text) {
     return result.ec == std::errc{} && result.ptr == text.data() + text.size() && value <= 10000000 ? value : 0;
 }
 
+class EventPayloads {
+    const unsigned reader_bits;
+    const uint32_t reader_mask;
+    static constexpr unsigned bucket_bits = std::bit_width(person_bucket_count - 1);
+
+public:
+    std::vector<PersonBuckets<RawEvent>> rows;
+    explicit EventPayloads(size_t readers)
+        : reader_bits(std::bit_width(readers - 1)),
+          reader_mask(reader_bits < 31 ? (uint32_t{1} << reader_bits) - 1 : 0), rows(readers) {
+        if (reader_bits + bucket_bits >= 30) throw WideEventLayout{};
+    }
+
+    uint32_t store(size_t reader, const RawEvent& row) {
+        const auto bucket = bucket_from_hash<person_bucket_count>(row.user_hash);
+        auto& partition = rows[reader][bucket];
+        if (partition.size() >= (UINT32_MAX >> (reader_bits + bucket_bits))) throw WideEventLayout{};
+        const auto token = static_cast<uint32_t>((partition.size() << (reader_bits + bucket_bits)) |
+            (bucket << reader_bits) | reader);
+        partition.push_back(row);
+        return token;
+    }
+
+    void discard(uint32_t token) {
+        // Each payload has exactly one version in one event-ID partition.
+        if (token == missing_payload) return;
+        rows[token & reader_mask][(token >> reader_bits) & (person_bucket_count - 1)]
+            [token >> (reader_bits + bucket_bits)].ts = invalid_event;
+    }
+};
+
+size_t estimate_event_count(const MappedInput& mapped) {
+    size_t bytes = 0;
+    for (const auto& part : mapped.parts) bytes += part.end - part.first;
+    size_t sampled_bytes = 0, sampled_rows = 0;
+    const size_t interval = std::max<size_t>(1, mapped.parts.size() / 16);
+    for (size_t i = 0; i < mapped.parts.size(); i += interval) {
+        auto part = align_part(mapped.parts[i]);
+        auto line = part.first;
+        for (size_t n = 0; n < 128 && line < part.end; ++n) {
+            line = next_line(line, part.end);
+            ++sampled_rows;
+        }
+        sampled_bytes += line - part.first;
+    }
+    if (!sampled_rows) return 0;
+    // Sampled density controls capacity only. Malformed short rows do not
+    // inflate the reservation beyond the minimum possible event width.
+    const auto average = std::max(27.0, static_cast<double>(sampled_bytes) / sampled_rows);
+    return static_cast<size_t>(bytes / average);
+}
+
 void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64_t end,
-                 Keys& keys, const Dimensions& dims, std::vector<Buckets<Event>>& output) {
+                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads) {
+    const auto origin = start / 1000 - (int64_t{1} << 31);
+    const auto rows_per_worker = estimate_event_count(mapped) / workers;
+    const auto reserved = rows_per_worker + rows_per_worker / 8;
+    std::vector<char> ready(workers);
     parallel(workers, mapped.parts.size(), [&](size_t worker, size_t part) {
+        if (reserved >= 256 * person_bucket_count && !ready[worker]) {
+            for (auto& bucket : output[worker]) bucket.reserve(reserved / event_bucket_count);
+            for (auto& bucket : payloads.rows[worker]) bucket.reserve(reserved / person_bucket_count);
+            ready[worker] = 1;
+        }
         read_part<7>(mapped.parts[part], [&](const auto& fields) {
-            auto id = keys.encode(fields[0]);
+            const auto id_hash = hash_key(keys.encode(fields[0]));
             if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
-            auto ingest = ingest_seconds(fields[3]);
-            Event event{id, 0, static_cast<uint64_t>(ingest + ingest_bias) << 24, invalid_event, 0};
+            const auto ingest = ingest_seconds(fields[3]);
+            const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
+            if (order > UINT32_MAX) throw WideEventLayout{};
+            EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
             auto ts = timestamp_ms(fields[2]);
             if (ts && *ts >= start && *ts < end && ingest * 1000 - *ts <= day_ms &&
                 !fields[1].empty() && !fields[5].empty()) {
+                const auto offset = static_cast<uint32_t>(*ts - start);
                 if (fields[4] == "purchase") {
                     auto price = parse_price(fields[6]);
                     if (price) {
-                        event.ts = *ts - start;
-                        event.ingest_and_price |= price;
-                        event.category = dims.products.get(keys.encode(fields[5]), 0);
+                        auto category = dims.products.get(keys.encode(fields[5]), 0);
+                        const auto user_hash = hash_key(keys.encode(fields[1]));
+                        version.position = payloads.store(worker, {user_hash, offset, price | (category << 24)});
                     }
                 } else if (fields[4] == "view" || fields[4] == "cart") {
-                    event.ts = *ts - start;
+                    version.position = payloads.store(worker, {hash_key(keys.encode(fields[1])), offset, 0});
                 }
-                if (event.ts != invalid_event) event.user = keys.encode(fields[1]);
             }
-            // Preserve invalid copies here so the earliest copy always wins.
-            output[worker][bucket_for(id)].push_back(event);
+            output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
         });
     });
 }
 
-void deduplicate(std::vector<Buckets<Event>>& events, size_t workers, const Lookup<Key>& people,
-                 std::vector<Buckets<SessionEvent>>& output) {
-    parallel(workers, bucket_count, [&](size_t worker, size_t bucket) {
-        size_t size = 0;
-        for (auto& feed : events) size += feed[bucket].size();
-        if (!size) return;
-        // An event in a singleton hash slot has no duplicate. Colliding slots
-        // are resolved by exact ID, including invalid copies.
-        const size_t homes = std::bit_ceil(std::max<size_t>(64, size * 8));
+void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayloads& payloads) {
+    parallel(workers, event_bucket_count, [&](size_t, size_t bucket) {
+        size_t count = 0;
+        for (const auto& feed : events) count += feed[bucket].size();
+        if (!count) return;
+        const size_t homes = std::bit_ceil(std::max<size_t>(64, count * 8));
         std::vector<uint64_t> seen(homes / 64), repeated(homes / 64);
         size_t collisions = 0;
         for (const auto& feed : events) {
-            for (const auto& event : feed[bucket]) {
-                size_t home = hash_key(event.id) & (homes - 1);
-                uint64_t bit = uint64_t{1} << (home % 64);
-                auto old = seen[home / 64];
-                seen[home / 64] = old | bit;
-                if (old & bit) {
+            for (const auto& version : feed[bucket]) {
+                const auto home = version.id_hash & (homes - 1);
+                const auto bit = uint64_t{1} << (home % 64);
+                auto& word = seen[home / 64];
+                if (word & bit) {
                     repeated[home / 64] |= bit;
                     ++collisions;
                 }
+                word |= bit;
             }
         }
         const size_t capacity = std::bit_ceil(std::max<size_t>(2, collisions * 4));
         std::vector<uint32_t> index(capacity, invalid_event);
-        std::vector<const Event*> winners;
+        std::vector<const EventVersion*> winners;
         winners.reserve(collisions * 2);
-        auto emit = [&](const Event& event) {
-            if (event.ts == invalid_event) return;
-            auto hash = hash_key(event.user);
-            auto person = people.get_filtered(event.user, hash, event.user);
-            output[worker][bucket_from_hash(person == event.user ? hash : hash_key(person))].push_back({
-                person, event.ts, static_cast<uint32_t>(event.ingest_and_price & price_mask) | (event.category << 24),
-            });
-        };
         for (const auto& feed : events) {
-            for (const auto& event : feed[bucket]) {
-                auto hash = hash_key(event.id);
-                size_t home = hash & (homes - 1);
-                if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) {
-                    emit(event);
-                    continue;
-                }
-                size_t slot = hash & (capacity - 1);
-                while (index[slot] != invalid_event && winners[index[slot]]->id != event.id) {
+            for (const auto& version : feed[bucket]) {
+                const auto hash = version.id_hash;
+                const auto home = hash & (homes - 1);
+                if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) continue;
+                auto slot = hash & (capacity - 1);
+                while (index[slot] != invalid_event && winners[index[slot]]->id_hash != version.id_hash) {
                     slot = (slot + 1) & (capacity - 1);
                 }
                 if (index[slot] == invalid_event) {
                     index[slot] = winners.size();
-                    winners.push_back(&event);
+                    winners.push_back(&version);
                 } else {
                     auto& current = winners[index[slot]];
-                    if ((event.ingest_and_price >> 24) < (current->ingest_and_price >> 24)) current = &event;
+                    if (version.ingest < current->ingest) {
+                        payloads.discard(current->position);
+                        current = &version;
+                    } else {
+                        payloads.discard(version.position);
+                    }
                 }
             }
         }
-        for (const auto* event : winners) emit(*event);
-        for (auto& feed : events) std::vector<Event>().swap(feed[bucket]);
+        for (auto& feed : events) std::vector<EventVersion>().swap(feed[bucket]);
     });
 }
 
 void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
-                 const Dimensions& dims, const Lookup<Key>& people, std::vector<Buckets<Click>>& output) {
-    parallel(workers, mapped.parts.size(), [&](size_t worker, size_t part) {
-        read_part<4>(mapped.parts[part], [&](const auto& fields) {
-            if (fields[1].empty() || fields[2].empty()) return;
-            auto ts = timestamp_ms(fields[3]);
-            if (!ts || *ts < start - week_ms || *ts >= end) return;
-            auto campaign = dims.campaigns.get(keys.encode(fields[2]), missing_campaign);
-            if (campaign == missing_campaign) return;
-            auto user = keys.encode(fields[1]);
-            auto hash = hash_key(user);
-            auto person = people.get_filtered(user, hash, user);
-            output[worker][bucket_from_hash(person == user ? hash : hash_key(person))].push_back({person, keys.encode(fields[0]), static_cast<uint32_t>(*ts - (start - week_ms)), campaign});
-        });
+                 const Dimensions& dims, std::vector<PersonBuckets<RawClick>>& output,
+                 std::atomic<size_t>& next, size_t worker_offset) {
+    parallel(workers, workers, [&](size_t, size_t group) {
+        const auto worker = worker_offset + group;
+        for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
+            read_part<4>(mapped.parts[part], [&](const auto& fields) {
+                if (fields[1].empty() || fields[2].empty()) return;
+                auto ts = timestamp_ms(fields[3]);
+                if (!ts || *ts < start - week_ms || *ts >= end) return;
+                auto campaign = dims.campaigns.get(keys.encode(fields[2]), missing_campaign);
+                if (campaign == missing_campaign) return;
+                const auto hash = hash_key(keys.encode(fields[1]));
+                const auto bucket = bucket_from_hash<person_bucket_count>(hash);
+                const auto offset = static_cast<uint32_t>(*ts - (start - week_ms));
+                output[worker][bucket].push_back({hash, keys.encode(fields[0]), offset, campaign});
+            });
+        }
     });
 }
 
@@ -290,8 +348,98 @@ struct TimelineClick {
 struct PersonRange {
     Key person;
     size_t events = 0, clicks = 0;
-    size_t event_offset = 0, click_offset = 0;
+    uint32_t first_event = UINT32_MAX, first_click = UINT32_MAX;
 };
+
+struct TimelineSpan {
+    Key person;
+    uint32_t raw_bucket;
+    uint32_t event_offset, events;
+    uint32_t click_offset, clicks;
+};
+struct TimelineStorage {
+    std::array<std::unique_ptr<TimelineEvent[]>, person_bucket_count> events;
+    std::array<std::unique_ptr<TimelineClick[]>, person_bucket_count> clicks;
+};
+using SpanPartitions = std::vector<PersonBuckets<TimelineSpan>>;
+
+void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawClick>>& clicks,
+                        size_t workers, const Lookup<Key>& aliases,
+                        TimelineStorage& storage, SpanPartitions& routed) {
+    parallel(workers, person_bucket_count, [&](size_t worker, size_t bucket) {
+        size_t event_count = 0, click_count = 0;
+        for (const auto& feed : payloads.rows) event_count += feed[bucket].size();
+        for (const auto& feed : clicks) click_count += feed[bucket].size();
+        if (!event_count && !click_count) return;
+        if (uint64_t{event_count} + click_count >= UINT32_MAX) throw WideEventLayout{};
+        Lookup<uint32_t, true> people((event_count + click_count) / 16 + 1);
+        struct RawUser {
+            uint64_t hash;
+            uint32_t events = 0, clicks = 0;
+            uint32_t event_cursor = 0, click_cursor = 0;
+        };
+        std::vector<RawUser> ranges;
+        std::vector<uint32_t> event_groups, click_groups;
+        event_groups.reserve(event_count);
+        click_groups.reserve(click_count);
+        auto get_group = [&](uint64_t hash) {
+            auto next = static_cast<uint32_t>(ranges.size());
+            people.reserve(next + 1);
+            auto group = people.find_or_insert(hash, next);
+            if (group == next) ranges.push_back(RawUser{.hash = hash});
+            return group;
+        };
+        for (const auto& feed : payloads.rows) {
+            for (const auto& event : feed[bucket]) {
+                if (event.ts == invalid_event) continue;
+                auto group = get_group(event.user_hash);
+                ++ranges[group].events;
+                event_groups.push_back(group);
+            }
+        }
+        for (const auto& feed : clicks) {
+            for (const auto& click : feed[bucket]) {
+                auto group = get_group(click.user_hash);
+                ++ranges[group].clicks;
+                click_groups.push_back(group);
+            }
+        }
+        // Route each raw ID once, including IDs with clicks but no events.
+        uint32_t event_offset = 0, click_offset = 0;
+        for (auto& range : ranges) {
+            const auto hash = range.hash;
+            const auto user = unhash_key(hash);
+            const auto person = aliases.get_filtered(user, hash, user);
+            const auto dest = bucket_from_hash<person_bucket_count>(person == user ? hash : hash_key(person));
+            routed[worker][dest].push_back({person, static_cast<uint32_t>(bucket),
+                                           event_offset, range.events, click_offset, range.clicks});
+            range.event_cursor = event_offset;
+            range.click_cursor = click_offset;
+            event_offset += range.events;
+            click_offset += range.clicks;
+        }
+        auto& event_timeline = storage.events[bucket];
+        auto& click_timeline = storage.clicks[bucket];
+        // The per-ID counts give disjoint spans that the two scatter loops fill.
+        event_timeline = std::make_unique_for_overwrite<TimelineEvent[]>(event_offset);
+        click_timeline = std::make_unique_for_overwrite<TimelineClick[]>(click_offset);
+        size_t row = 0;
+        for (auto& feed : payloads.rows) {
+            for (const auto& event : feed[bucket]) {
+                if (event.ts == invalid_event) continue;
+                event_timeline[ranges[event_groups[row++]].event_cursor++] = {event.ts, event.purchase};
+            }
+            std::vector<RawEvent>().swap(feed[bucket]);
+        }
+        row = 0;
+        for (auto& feed : clicks) {
+            for (const auto& click : feed[bucket]) {
+                click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id, click.ts, click.campaign};
+            }
+            std::vector<RawClick>().swap(feed[bucket]);
+        }
+    });
+}
 
 class Attribution {
     std::vector<uint32_t> active, counts, position;
@@ -333,83 +481,156 @@ public:
     }
 };
 
-void summarize_bucket(std::vector<Buckets<SessionEvent>>& event_sources,
-                      std::vector<Buckets<Click>>& click_sources, size_t bucket,
-                      const Keys& keys, const Dimensions& dims, int64_t start, int32_t first_day,
-                      Attribution& attribution, std::vector<UserDay>& users,
-                      std::vector<CampaignMetrics>& campaign_days) {
-    size_t event_count = 0, click_count = 0;
-    for (const auto& source : event_sources) event_count += source[bucket].size();
-    for (const auto& source : click_sources) click_count += source[bucket].size();
-    if (!event_count) {
-        for (auto& source : click_sources) std::vector<Click>().swap(source[bucket]);
-        return;
-    }
-    // Count each person's rows first, then scatter small timeline records
-    // into contiguous spans. Only timestamps inside one person need sorting.
-    Lookup<uint32_t> people(event_count / 16 + 1);
-    std::vector<PersonRange> ranges;
-    std::vector<uint32_t> event_groups, click_groups;
-    event_groups.reserve(event_count);
-    click_groups.reserve(click_count);
-    for (const auto& source : event_sources) {
-        for (const auto& event : source[bucket]) {
-            auto next = static_cast<uint32_t>(ranges.size());
-            people.reserve(next + 1);
-            auto group = people.find_or_insert(event.person, next);
-            if (group == next) ranges.push_back(PersonRange{.person = event.person});
-            ++ranges[group].events;
-            event_groups.push_back(group);
-        }
-    }
-    for (const auto& source : click_sources) {
-        for (const auto& click : source[bucket]) {
-            auto group = people.get(click.person, missing_campaign);
-            if (group != missing_campaign) ++ranges[group].clicks;
-            click_groups.push_back(group);
+// Events within a bin are at most one session gap apart. The first
+// and last timestamps suffice to decide whether consecutive bins join.
+class TimeBins {
+    static constexpr size_t capacity = UINT32_MAX / session_gap + 1;
+
+    struct Bin {
+        uint32_t first;
+        uint32_t last;
+        uint32_t count;
+        uint32_t purchase_head;
+    };
+    struct Purchase {
+        uint32_t value;
+        uint32_t next;
+    };
+
+    std::array<Bin, capacity> bins;
+    std::array<uint64_t, (capacity + 63) / 64> occupied{};
+    std::vector<Purchase> purchases;
+    static_assert((capacity + 63) / 64 <= 64);
+    uint64_t used_words = 0;
+
+public:
+    void add(std::span<const TimelineEvent> events) {
+        for (const auto& event : events) {
+            const auto slot = event.ts / session_gap;
+            auto& bin = bins[slot];
+            const size_t word = slot / 64;
+            const uint64_t bit = uint64_t{1} << (slot % 64);
+            if (!(occupied[word] & bit)) {
+                bin = {event.ts, event.ts, 1, UINT32_MAX};
+                occupied[word] |= bit;
+                used_words |= uint64_t{1} << word;
+            } else {
+                bin.first = std::min(bin.first, event.ts);
+                bin.last = std::max(bin.last, event.ts);
+                ++bin.count;
+            }
+            if (event.purchase) {
+                purchases.push_back({event.purchase, bin.purchase_head});
+                bin.purchase_head = static_cast<uint32_t>(purchases.size() - 1);
+            }
         }
     }
 
-    size_t event_offset = 0, click_offset = 0;
-    for (auto& range : ranges) {
-        range.event_offset = event_offset;
-        range.click_offset = click_offset;
-        event_offset += range.events;
-        click_offset += range.clicks;
-    }
-    std::vector<TimelineEvent> events(event_offset);
-    std::vector<TimelineClick> clicks(click_offset);
-    size_t row = 0;
-    for (auto& source : event_sources) {
-        for (const auto& event : source[bucket]) {
-            auto& range = ranges[event_groups[row++]];
-            events[range.event_offset++] = {event.ts, event.purchase};
+    template<class Visit>
+    void drain(Visit visit) {
+        while (used_words) {
+            const size_t word = std::countr_zero(used_words);
+            for (auto mask = occupied[word]; mask; mask &= mask - 1) {
+                visit(bins[word * 64 + std::countr_zero(mask)]);
+            }
+            occupied[word] = 0;
+            used_words &= used_words - 1;
         }
-        std::vector<SessionEvent>().swap(source[bucket]);
+        purchases.clear();
     }
-    row = 0;
-    for (auto& source : click_sources) {
-        for (const auto& click : source[bucket]) {
-            auto group = click_groups[row++];
-            if (group != missing_campaign) {
-                clicks[ranges[group].click_offset++] = {click.id, click.ts, click.campaign};
+
+    template<class Visit>
+    void visit_purchases(uint32_t head, Visit visit) const {
+        for (; head != UINT32_MAX; head = purchases[head].next) visit(purchases[head].value);
+    }
+};
+
+void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, size_t bucket,
+                      const Keys& keys, const Dimensions& dims, int64_t start, int32_t first_day,
+                      Attribution& attribution, parquet::File& users,
+                      std::vector<CampaignMetrics>& campaign_days) {
+    size_t span_count = 0;
+    for (const auto& source : sources) span_count += source[bucket].size();
+    if (!span_count) return;
+    Lookup<uint32_t> people(span_count);
+    std::vector<PersonRange> ranges;
+    struct Piece { const TimelineSpan* span; uint32_t next_event, next_click; };
+    std::vector<Piece> pieces;
+    pieces.reserve(span_count);
+    for (const auto& source : sources) {
+        for (const auto& span : source[bucket]) {
+            auto next = static_cast<uint32_t>(ranges.size());
+            auto group = people.find_or_insert(span.person, next);
+            if (group == next) ranges.push_back(PersonRange{.person = span.person});
+            auto& range = ranges[group];
+            auto index = static_cast<uint32_t>(pieces.size());
+            pieces.push_back({&span, range.first_event, range.first_click});
+            if (span.events) {
+                range.first_event = index;
+                range.events += span.events;
+            }
+            if (span.clicks) {
+                range.first_click = index;
+                range.clicks += span.clicks;
             }
         }
-        std::vector<Click>().swap(source[bucket]);
     }
 
     std::vector<int64_t> category_revenue(dims.categories.size());
     std::vector<uint32_t> purchased_categories;
+    TimeBins bins;
+    std::vector<TimelineEvent> combined_events;
+    std::vector<TimelineClick> combined_clicks;
+    auto event_span = [&](const TimelineSpan& piece) {
+        return std::span(storage.events[piece.raw_bucket].get() + piece.event_offset, piece.events);
+    };
+    auto click_span = [&](const TimelineSpan& piece) {
+        return std::span(storage.clicks[piece.raw_bucket].get() + piece.click_offset, piece.clicks);
+    };
     for (const auto& range : ranges) {
-        auto person_events = std::span(events).subspan(range.event_offset - range.events, range.events);
-        auto person_clicks = std::span(clicks).subspan(range.click_offset - range.clicks, range.clicks);
-        std::sort(person_events.begin(), person_events.end(), [](const auto& a, const auto& b) { return a.ts < b.ts; });
+        if (!range.events) continue;
+        auto first = range.first_event;
+        std::span<TimelineEvent> person_events;
+        constexpr size_t binning_threshold = 16;
+        const bool use_bins = range.events >= binning_threshold && range.events < UINT32_MAX;
+        if (use_bins) {
+            for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_event) {
+                bins.add(event_span(*pieces[piece].span));
+            }
+        } else {
+            // Sort a single small span in place and merge linked spans as needed.
+            person_events = event_span(*pieces[first].span);
+            if (pieces[first].next_event != UINT32_MAX) {
+                combined_events.clear();
+                combined_events.reserve(range.events);
+                for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_event) {
+                    auto span = event_span(*pieces[piece].span);
+                    combined_events.insert(combined_events.end(), span.begin(), span.end());
+                }
+                person_events = std::span(combined_events);
+            }
+            std::sort(person_events.begin(), person_events.end(), [](const auto& a, const auto& b) { return a.ts < b.ts; });
+        }
+        std::span<TimelineClick> person_clicks;
+        if (range.clicks) {
+            first = range.first_click;
+            person_clicks = click_span(*pieces[first].span);
+            if (pieces[first].next_click != UINT32_MAX) {
+                combined_clicks.clear();
+                combined_clicks.reserve(range.clicks);
+                for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_click) {
+                    auto span = click_span(*pieces[piece].span);
+                    combined_clicks.insert(combined_clicks.end(), span.begin(), span.end());
+                }
+                person_clicks = std::span(combined_clicks);
+            }
+        }
         std::sort(person_clicks.begin(), person_clicks.end(), [&](const auto& a, const auto& b) {
             if (a.ts != b.ts) return a.ts < b.ts;
             return keys.less(b.id, a.id);
         });
         attribution.reset();
-        UserDay daily{.person = range.person, .day = utc_day(start + person_events[0].ts)};
+        UserDay daily{.person = range.person};
         auto emit_day = [&] {
             int64_t largest = 0;
             for (auto category : purchased_categories) {
@@ -421,33 +642,60 @@ void summarize_bucket(std::vector<Buckets<SessionEvent>>& event_sources,
                 category_revenue[category] = 0;
             }
             purchased_categories.clear();
-            users.push_back(daily);
+            parquet::append_user(users, daily, keys, dims.categories);
         };
-        for (size_t event = 0; event < person_events.size();) {
-            auto session_start = person_events[event].ts;
-            auto day = utc_day(start + session_start);
+        auto begin_session = [&](uint32_t session_start) {
+            const auto day = utc_day(start + session_start);
             if (day != daily.day) {
-                emit_day();
+                if (daily.sessions) emit_day();
                 daily = UserDay{.person = range.person, .day = day};
             }
             ++daily.sessions;
-            uint32_t previous = session_start;
-            int64_t revenue = 0;
-            do {
-                const auto& row = person_events[event++];
-                previous = row.ts;
-                ++daily.events;
-                if (row.purchase) {
-                    auto category = row.purchase >> 24;
-                    auto price = row.purchase & price_mask;
-                    revenue += price;
-                    if (!category_revenue[category]) purchased_categories.push_back(category);
-                    category_revenue[category] += price;
-                }
-            } while (event < person_events.size() && person_events[event].ts - previous <= session_gap);
+        };
+        auto add_purchase = [&](uint32_t purchase) {
+            const auto category = purchase >> 24;
+            const auto price = purchase & price_mask;
+            if (!category_revenue[category]) purchased_categories.push_back(category);
+            category_revenue[category] += price;
+            return price;
+        };
+        auto finish_session = [&](uint32_t session_start, int64_t revenue) {
             daily.revenue += revenue;
             attribution.credit(person_clicks, session_start + week_ms,
-                               static_cast<size_t>(day - first_day) * dims.campaign_values.size(), revenue, campaign_days);
+                               static_cast<size_t>(daily.day - first_day) * dims.campaign_values.size(),
+                               revenue, campaign_days);
+        };
+        if (use_bins) {
+            uint32_t session_start = invalid_event, previous = 0;
+            int64_t revenue = 0;
+            bins.drain([&](const auto& bin) {
+                if (session_start == invalid_event || bin.first - previous > session_gap) {
+                    if (session_start != invalid_event) finish_session(session_start, revenue);
+                    session_start = bin.first;
+                    begin_session(session_start);
+                    revenue = 0;
+                }
+                previous = bin.last;
+                daily.events += bin.count;
+                bins.visit_purchases(bin.purchase_head, [&](uint32_t purchase) {
+                    revenue += add_purchase(purchase);
+                });
+            });
+            finish_session(session_start, revenue);
+        } else {
+            for (size_t event = 0; event < person_events.size();) {
+                const auto session_start = person_events[event].ts;
+                begin_session(session_start);
+                uint32_t previous;
+                int64_t revenue = 0;
+                do {
+                    const auto& row = person_events[event++];
+                    previous = row.ts;
+                    ++daily.events;
+                    if (row.purchase) revenue += add_purchase(row.purchase);
+                } while (event < person_events.size() && person_events[event].ts - previous <= session_gap);
+                finish_session(session_start, revenue);
+            }
         }
         emit_day();
     }
@@ -467,85 +715,153 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     Lookup<Key> people;
     mark("dimensions");
     // Event-ID buckets keep all revisions together, even if their user IDs differ.
-    std::vector<Buckets<SessionEvent>> valid(workers);
+    EventPayloads payloads(workers);
+    std::vector<PersonBuckets<RawClick>> clicks(workers);
     {
-        MappedInput mapped;
-        mapped.folder(input / "events", input_chunk);
-        std::vector<Buckets<Event>> events(workers);
+        MappedInput event_input, click_input;
+        event_input.folder(input / "events", input_chunk);
+        click_input.folder(input / "clicks", input_chunk);
+        std::vector<EventBuckets> events(workers);
+        std::atomic<size_t> next_click{0};
         if (workers == 1) {
             people = link_people(keys, input, 1);
-            read_events(mapped, workers, start, end, keys, dims, events);
+            read_events(event_input, 1, start, end, keys, dims, events, payloads);
+            read_clicks(click_input, 1, start, end, keys, dims, clicks, next_click, 0);
         } else {
             const auto graph_workers = std::min<size_t>(2, workers - 1);
-            std::promise<Lookup<Key>> graph;
-            auto result = graph.get_future();
-            double link_seconds = 0;
+            std::exception_ptr link_or_click_error;
             std::jthread resolve([&] {
                 try {
-                    auto begin = std::chrono::steady_clock::now();
-                    auto resolved = link_people(keys, input, graph_workers);
-                    link_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-                    graph.set_value(std::move(resolved));
+                    people = link_people(keys, input, graph_workers);
+                    read_clicks(click_input, graph_workers, start, end, keys, dims, clicks, next_click, 0);
                 } catch (...) {
-                    graph.set_exception(std::current_exception());
+                    link_or_click_error = std::current_exception();
                 }
             });
-            auto parse_start = std::chrono::steady_clock::now();
-            read_events(mapped, workers - graph_workers, start, end, keys, dims, events);
-            auto parse_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - parse_start).count();
-            people = result.get();
-            if (profile) {
-                std::cerr << "link graph: " << link_seconds << " s\n"
-                          << "parse workers: " << parse_seconds << " s\n";
-            }
+            read_events(event_input, workers - graph_workers, start, end, keys, dims, events, payloads);
+            read_clicks(click_input, workers - graph_workers, start, end, keys, dims, clicks, next_click, graph_workers);
+            resolve.join();
+            if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
-        mark("event parse and links");
-        deduplicate(events, workers, people, valid);
+        mark("parse and link");
+        deduplicate(events, workers, payloads);
         mark("event dedup");
     }
-
-    // The second partitioning groups surviving events and clicks by canonical person.
-    std::vector<Buckets<Click>> clicks(workers);
-    {
-        MappedInput mapped;
-        mapped.folder(input / "clicks", input_chunk);
-        read_clicks(mapped, workers, start, end, keys, dims, people, clicks);
-    }
-    mark("click parse");
+    TimelineStorage storage;
+    SpanPartitions spans(workers);
+    group_raw_payloads(payloads, clicks, workers, people, storage, spans);
+    mark("group raw users");
     auto first_day = utc_day(start);
     auto day_count = utc_day(end - 1) - first_day + 1;
     size_t campaign_slots = day_count * dims.campaign_values.size();
-    std::vector<std::vector<UserDay>> users(bucket_count);
+    const auto user_output = output / "user_daily";
+    fs::create_directories(user_output);
     std::vector<std::vector<CampaignMetrics>> campaigns(workers, std::vector<CampaignMetrics>(campaign_slots));
     std::vector<Attribution> attribution(workers, Attribution(dims.campaign_values.size()));
-    parallel(workers, bucket_count, [&](size_t worker, size_t bucket) {
-        summarize_bucket(valid, clicks, bucket, keys, dims, start, first_day,
-                         attribution[worker], users[bucket], campaigns[worker]);
+    std::atomic<size_t> next_bucket{0};
+    parallel(workers, workers, [&](size_t, size_t worker) {
+        parquet::File writer(user_output / ("part-" + std::to_string(worker) + ".parquet"), parquet::user_schema);
+        for (size_t bucket; (bucket = next_bucket.fetch_add(1, std::memory_order_relaxed)) < person_bucket_count;) {
+            summarize_bucket(storage, spans, bucket, keys, dims, start, first_day,
+                             attribution[worker], writer, campaigns[worker]);
+        }
+        writer.finish();
     });
-    mark("sort, sessionize and attribute");
+    mark("sessionize, attribute and write user Parquet");
     for (size_t worker = 1; worker < workers; ++worker) {
         for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot] += campaigns[worker][slot];
     }
-    write_outputs(output, keys, dims.categories, dims.campaign_values, users, campaigns[0], first_day, workers);
-    mark("Parquet output");
+    write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
+    mark("campaign Parquet");
     if (profile) {
         struct rusage usage {};
         if (getrusage(RUSAGE_SELF, &usage) == 0) std::cerr << "peak RSS: " << usage.ru_maxrss << " KiB\n";
     }
-    return 0;
+    // The writers have closed their files and joined. Let the kernel reclaim
+    // the remaining in-memory result buffers in this one-shot executable.
+#ifdef SHOPPING_PGO_TRAINING
+    // GCC writes its profile through an exit handler.
+    std::exit(0);
+#else
+    std::_Exit(0);
+#endif
 }
 } // namespace shopping
 
+namespace {
+std::optional<std::array<std::string, 2>> manifest_window(const shopping::fs::path& data) {
+    std::ifstream file(data / "manifest.json");
+    std::string json{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    std::string_view rest = json;
+    std::array<std::string, 2> values;
+    auto trim = [&] {
+        const auto first = rest.find_first_not_of(" \r\n\t");
+        rest.remove_prefix(first == std::string_view::npos ? rest.size() : first);
+    };
+    auto take = [&](char token) {
+        trim();
+        if (rest.empty() || rest.front() != token) return false;
+        rest.remove_prefix(1);
+        return true;
+    };
+    auto quoted = [&]() -> std::optional<std::string_view> {
+        if (!take('"')) return std::nullopt;
+        const auto end = rest.find_first_of("\"\\");
+        if (end == std::string_view::npos || rest[end] != '"') return std::nullopt;
+        auto value = rest.substr(0, end);
+        rest.remove_prefix(end + 1);
+        return value;
+    };
+    // Extended JSON (object members or escaped strings) uses the reference
+    // launcher, which already has a complete JSON parser.
+    if (!take('{')) return std::nullopt;
+    for (int i = 0; i < 2; ++i) {
+        auto key = quoted();
+        if (!key || !take(':')) return std::nullopt;
+        auto value = quoted();
+        if (!value || value->empty()) return std::nullopt;
+        if (*key == "window_start") values[0] = *value;
+        else if (*key == "window_end") values[1] = *value;
+        else return std::nullopt;
+        if (!take(i == 0 ? ',' : '}')) return std::nullopt;
+    }
+    trim();
+    if (!rest.empty() || values[0].empty() || values[1].empty()) return std::nullopt;
+    return values;
+}
+
+const char* environment(const char* name, const char* fallback) {
+    if (auto value = std::getenv(name); value && *value) return value;
+    return fallback;
+}
+
+int invoke(const shopping::fs::path& data, const shopping::fs::path& output,
+           std::string_view begin, std::string_view end, const char* threads) {
+    auto start_ms = timestamp_ms(begin);
+    auto end_ms = timestamp_ms(end);
+    if (!start_ms || !end_ms || *end_ms <= *start_ms) throw std::runtime_error("invalid manifest window");
+    if (static_cast<uint64_t>(*end_ms) - static_cast<uint64_t>(*start_ms) > shopping::invalid_event - shopping::week_ms) return 10;
+    auto workers = std::stoul(threads);
+    if (!workers) throw std::runtime_error("thread count must be positive");
+    return shopping::run(data, output, *start_ms, *end_ms, workers);
+}
+} // namespace
+
 int main(int argc, char** argv) {
     try {
-        if (argc != 6) throw std::runtime_error("usage: native_pipeline DATA OUTPUT START END THREADS");
-        auto start = timestamp_ms(argv[3]);
-        auto end = timestamp_ms(argv[4]);
-        if (!start || !end || *end <= *start) throw std::runtime_error("invalid manifest window");
-        if (static_cast<uint64_t>(*end) - static_cast<uint64_t>(*start) > shopping::invalid_event - shopping::week_ms) return 10;
-        auto workers = std::stoul(argv[5]);
-        if (!workers) throw std::runtime_error("thread count must be positive");
-        return shopping::run(argv[1], argv[2], *start, *end, workers);
+        if (argc == 1) {
+            const auto* data = environment("DATA_DIR", "/data");
+            const auto* threads = environment("NCPU", nullptr);
+            if (!threads) return 10;
+            auto window = manifest_window(data);
+            if (!window) return 10;
+            return invoke(data, environment("OUTPUT_DIR", "/output"),
+                          (*window)[0], (*window)[1], threads);
+        }
+        if (argc == 6) return invoke(argv[1], argv[2], argv[3], argv[4], argv[5]);
+        throw std::runtime_error("usage: native_pipeline [DATA OUTPUT START END THREADS]");
+    } catch (const shopping::WideEventLayout&) {
+        return 10;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

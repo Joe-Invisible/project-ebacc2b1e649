@@ -1,0 +1,13 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+invalid_first_alias,z_raw,invalid,2028-02-28T10:00:00Z,view,p_shoe,
+A10,z_raw,1835394420000,2028-02-28T23:47:00Z,view,p_shoe,
+A9,z_raw,1835394419998,2028-02-28T23:46:59Z,view,p_shoe,
+A8,z_raw,1835394419996,2028-02-28T23:46:59Z,view,p_shoe,
+A7,z_raw,1835394419994,2028-02-28T23:46:59Z,view,p_shoe,
+A6,z_raw,1835394419992,2028-02-28T23:46:59Z,view,p_shoe,
+A5,z_raw,1835394419990,2028-02-28T23:46:59Z,view,p_shoe,
+A4,z_raw,1835394419988,2028-02-28T23:46:59Z,view,p_shoe,
+A3,z_raw,1835394419986,2028-02-28T23:46:59Z,purchase,p_shoe,200
+A2,z_raw,1835394419984,2028-02-28T23:46:59Z,view,p_shoe,
+A1,z_raw,1835394419982,2028-02-28T23:46:59Z,view,p_shoe,
+A0,z_raw,1835394419980,2028-02-28T23:46:59Z,view,p_shoe,

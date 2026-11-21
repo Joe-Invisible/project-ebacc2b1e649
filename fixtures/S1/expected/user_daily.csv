@@ -1,0 +1,4 @@
+user_id,day,sessions,events,revenue_cents,top_category
+a_canonical,2028-02-28,1,17,400,books
+a_canonical,2028-02-29,1,1,125,shoes
+solo,2028-02-29,1,1,0,

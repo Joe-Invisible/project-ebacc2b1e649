@@ -306,20 +306,10 @@ inline void append_user(File& writer, const UserDay& row, const Keys& keys, cons
 }
 } // namespace parquet
 
-inline void write_outputs(const fs::path& output, const Keys& keys, const std::vector<std::string>& categories,
-                          const std::vector<Campaign>& campaigns, const std::vector<std::vector<UserDay>>& users,
-                          const std::vector<CampaignMetrics>& metrics, int32_t first_day, size_t workers) {
-    auto user_output = output / "user_daily";
+inline void write_campaigns(const fs::path& output, const std::vector<Campaign>& campaigns,
+                            const std::vector<CampaignMetrics>& metrics, int32_t first_day) {
     auto campaign_output = output / "campaign_daily";
-    fs::create_directories(user_output);
     fs::create_directories(campaign_output);
-    parallel(workers, workers, [&](size_t, size_t group) {
-        parquet::File writer(user_output / ("part-" + std::to_string(group) + ".parquet"), parquet::user_schema);
-        for (size_t bucket = group; bucket < users.size(); bucket += workers) {
-            for (const auto& row : users[bucket]) parquet::append_user(writer, row, keys, categories);
-        }
-        writer.finish();
-    });
     parquet::File writer(campaign_output / "part-0.parquet", parquet::campaign_schema);
     for (size_t slot = 0; slot < metrics.size(); ++slot) {
         const auto& metric = metrics[slot];

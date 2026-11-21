@@ -1,0 +1,7 @@
+campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions
+c_border,display,2028-02-28,0,0,0,1
+c_search,search,2028-02-28,0,0,0,1
+c_search,search,2028-02-29,1,1,125,1
+c_social,social,2028-02-28,1,1,400,1
+c_social,social,2028-02-29,0,0,0,1
+organic,organic,2028-02-29,1,0,0,0

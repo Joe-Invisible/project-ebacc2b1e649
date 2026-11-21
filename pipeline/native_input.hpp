@@ -29,10 +29,22 @@ namespace shopping {
 namespace fs = std::filesystem;
 using Key = uint64_t;
 
+inline constexpr uint64_t key_multiplier = 0xff51afd7ed558ccdULL;
+inline constexpr uint64_t inverse_key_multiplier = 0x4f74430c22a54005ULL;
+static_assert(key_multiplier * inverse_key_multiplier == 1);
+
+// The xor-shift is its own inverse, and the odd multiplier is invertible.
 inline uint64_t hash_key(uint64_t key) {
     key ^= key >> 33;
-    key *= 0xff51afd7ed558ccdULL;
+    key *= key_multiplier;
     return key ^ (key >> 33);
+}
+
+// The mixer permutes all 64-bit keys, so a stored hash preserves exact identity.
+inline Key unhash_key(uint64_t hash) {
+    hash ^= hash >> 33;
+    hash *= inverse_key_multiplier;
+    return hash ^ (hash >> 33);
 }
 
 // Short ASCII keys preserve byte order. Other strings are interned exactly.
@@ -104,28 +116,35 @@ using CsvMask = __uint128_t;
 template <size_t Width>
 bool split_masks(std::string_view line, CsvMask commas, CsvMask quotes,
                  std::array<std::string_view, Width>& fields) {
-    if (std::popcount(static_cast<uint64_t>(commas)) +
-        std::popcount(static_cast<uint64_t>(commas >> 64)) != Width - 1) return false;
+    auto low = static_cast<uint64_t>(commas);
+    auto high = static_cast<uint64_t>(commas >> 64);
+    if (std::popcount(low) + std::popcount(high) != Width - 1) return false;
 
     size_t start = 0;
-    CsvMask allowed_quotes = 0;
+    unsigned accepted_quotes = 0;
     for (size_t column = 0; column < Width; ++column) {
         size_t end = line.size();
         if (column + 1 < Width) {
-            auto low = static_cast<uint64_t>(commas);
-            end = low ? std::countr_zero(low) : 64 + std::countr_zero(static_cast<uint64_t>(commas >> 64));
-            commas &= commas - 1;
+            if (low) {
+                end = std::countr_zero(low);
+                low &= low - 1;
+            } else {
+                end = 64 + std::countr_zero(high);
+                high &= high - 1;
+            }
         }
-        auto value = line.substr(start, end - start);
-        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
-            allowed_quotes |= (CsvMask{1} << start) | (CsvMask{1} << (end - 1));
-            value.remove_prefix(1);
-            value.remove_suffix(1);
-        }
-        fields[column] = value;
+        const auto length = end - start;
+        // A matched pair accounts for two distinct quote bytes. Comparing the
+        // count with the SIMD mask also rejects quotes anywhere inside a field.
+        unsigned quoted = 0;
+        if (length >= 2) quoted = (line[start] == '"') & (line[end - 1] == '"');
+        accepted_quotes += 2 * quoted;
+        fields[column] = {line.data() + start + quoted, length - 2 * quoted};
         start = end + 1;
     }
-    return quotes == allowed_quotes && !fields[0].empty();
+    if (!fields[0].size()) return false;
+    return accepted_quotes == static_cast<unsigned>(std::popcount(static_cast<uint64_t>(quotes)) +
+                                                     std::popcount(static_cast<uint64_t>(quotes >> 64)));
 }
 
 template <size_t Width>
@@ -153,16 +172,21 @@ bool split(std::string_view line, std::array<std::string_view, Width>& fields) {
     if (line.size() >= 32 && line.size() <= 128) return split_vectorized(line, fields);
 #endif
     for (size_t column = 0; column < Width; ++column) {
-        size_t comma = line.find(',');
-        if ((comma == std::string_view::npos) != (column + 1 == Width)) return false;
-        auto value = line.substr(0, comma);
+        const auto comma = line.find(',');
+        auto value = line;
+        if (column + 1 < Width) {
+            if (comma >= line.size()) return false;
+            value = {line.data(), comma};
+            line.remove_prefix(comma + 1);
+        } else if (comma != std::string_view::npos) {
+            return false;
+        }
         if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
             value.remove_prefix(1);
             value.remove_suffix(1);
         }
         if (value.find('"') != std::string_view::npos) return false;
         fields[column] = value;
-        if (column + 1 < Width) line.remove_prefix(comma + 1);
     }
     return !fields[0].empty();
 }
@@ -170,11 +194,21 @@ bool split(std::string_view line, std::array<std::string_view, Width>& fields) {
 struct Part {
     const char* first;
     const char* end;
+    // A non-null file end means that the chunk still needs row alignment.
+    const char* file_end = nullptr;
 };
 
 inline const char* next_line(const char* first, const char* end) {
     auto line = static_cast<const char*>(std::memchr(first, '\n', end - first));
     return line ? line + 1 : end;
+}
+
+inline Part align_part(Part part) {
+    if (!part.file_end) return part;
+    // The first chunk skips its header. Every other chunk starts after
+    // the row owned by its predecessor, even when a row spans many chunks.
+    return {next_line(part.first, part.file_end),
+            part.end == part.file_end ? part.end : next_line(part.end, part.file_end)};
 }
 
 class MappedInput {
@@ -202,12 +236,10 @@ public:
         auto first = static_cast<const char*>(address);
         auto end = first + info.st_size;
         mappings.push_back({first, end});
-        first = next_line(first, end);
         while (first < end) {
             auto target = first + std::min<size_t>(chunk_bytes, end - first);
-            auto last = target == end ? end : next_line(target, end);
-            parts.push_back({first, last});
-            first = last;
+            parts.push_back({first, target, end});
+            first = target;
         }
     }
     void folder(const fs::path& path, size_t chunk_bytes) {
@@ -225,43 +257,47 @@ public:
 
 template <size_t Width, class Function>
 void read_part(Part part, Function&& visit) {
+    part = align_part(part);
     std::array<std::string_view, Width> fields;
 #ifdef __AVX2__
     if constexpr (Width >= 4) {
         const auto comma = _mm256_set1_epi8(',');
         const auto quote = _mm256_set1_epi8('"');
         const auto newline = _mm256_set1_epi8('\n');
-        CsvMask commas = 0, quotes = 0;
-        auto cursor = part.first;
-        for (; part.end - cursor >= 32; cursor += 32) {
-            auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cursor));
-            auto lines = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, newline)));
-            auto block_commas = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma)));
-            auto block_quotes = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote)));
-            size_t offset = 0;
-            auto append = [&](size_t end) {
-                const auto count = end - offset;
-                const auto carried = cursor + offset - part.first;
-                if (count && carried + count <= 128) {
-                    const auto keep = (uint64_t{1} << count) - 1;
-                    commas |= CsvMask{(block_commas >> offset) & keep} << carried;
-                    quotes |= CsvMask{(block_quotes >> offset) & keep} << carried;
+        // Scan a short row from its first byte. Each aligned mask has a
+        // constant shift, and bytes past the first newline are excluded.
+        while (part.end - part.first >= 128) {
+            CsvMask commas = 0, quotes = 0;
+            const char* last = nullptr;
+            auto scan = [&]<size_t Offset>() {
+                const auto* cursor = part.first + Offset;
+                auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cursor));
+                auto lines = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, newline)));
+                uint32_t keep = UINT32_MAX;
+                if (lines) {
+                    const auto index = std::countr_zero(lines);
+                    keep = static_cast<uint32_t>((uint64_t{1} << index) - 1);
+                    last = cursor + index;
                 }
+                auto column = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma)));
+                auto quoted = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote)));
+                commas |= CsvMask{column & keep} << Offset;
+                quotes |= CsvMask{quoted & keep} << Offset;
+                return lines != 0;
             };
-            while (lines) {
-                auto end = static_cast<size_t>(std::countr_zero(lines));
-                append(end);
-                auto line = std::string_view(part.first, cursor + end - part.first);
-                bool valid = line.size() <= 128 ? split_masks(line, commas, quotes, fields) : split<Width>(line, fields);
-                if (valid) visit(fields);
-                lines &= lines - 1;
-                offset = end + 1;
-                part.first = cursor + offset;
-                commas = quotes = 0;
+            if (scan.template operator()<0>() || scan.template operator()<32>() ||
+                scan.template operator()<64>() || scan.template operator()<96>()) {
+                if (split_masks({part.first, static_cast<size_t>(last - part.first)}, commas, quotes, fields)) visit(fields);
+                part.first = last + 1;
+            } else {
+                auto next = next_line(part.first + 128, part.end);
+                size_t size = next - part.first - (next[-1] == '\n');
+                if (split<Width>({part.first, size}, fields)) visit(fields);
+                part.first = next;
             }
-            append(32);
         }
     }
+
 #endif
     while (part.first < part.end) {
         auto next = next_line(part.first, part.end);
@@ -295,8 +331,13 @@ void parallel(size_t workers, size_t count, Function&& work) {
     if (error) std::rethrow_exception(error);
 }
 
-template <class T>
+template <class T, bool Prehashed = false>
 class Lookup {
+    static uint64_t slot_hash(Key key) {
+        if constexpr (Prehashed) return key;
+        return hash_key(key);
+    }
+
     struct Slot {
         Key key = 0;
         T value{};
@@ -312,14 +353,14 @@ public:
     }
 
     void insert(Key key, T value) {
-        size_t slot = hash_key(key) & (slots.size() - 1);
+        size_t slot = slot_hash(key) & (slots.size() - 1);
         while (slots[slot].key && slots[slot].key != key) slot = (slot + 1) & (slots.size() - 1);
         slots[slot] = {key, value};
     }
 
     // The graph supplies each key once. Readers begin after all writers join.
     void insert_distinct_concurrently(Key key, T value) {
-        size_t slot = hash_key(key) & (slots.size() - 1);
+        size_t slot = slot_hash(key) & (slots.size() - 1);
         for (;;) {
             Key empty = 0;
             if (std::atomic_ref<Key>(slots[slot].key).compare_exchange_strong(
@@ -332,7 +373,7 @@ public:
     }
 
     T find_or_insert(Key key, T value) {
-        size_t slot = hash_key(key) & (slots.size() - 1);
+        size_t slot = slot_hash(key) & (slots.size() - 1);
         while (slots[slot].key && slots[slot].key != key) slot = (slot + 1) & (slots.size() - 1);
         if (!slots[slot].key) slots[slot] = {key, value};
         return slots[slot].value;
@@ -355,9 +396,16 @@ public:
     void index_homes() {
         occupied_homes.assign((slots.size() + 63) / 64, 0);
         for_each([&](Key key, T) {
-            size_t home = hash_key(key) & (slots.size() - 1);
+            size_t home = slot_hash(key) & (slots.size() - 1);
             occupied_homes[home / 64] |= uint64_t{1} << (home % 64);
         });
+    }
+
+    void prefetch_filtered(uint64_t hash) const {
+        size_t home = hash & (slots.size() - 1);
+        if (occupied_homes[home / 64] & (uint64_t{1} << (home % 64))) {
+            __builtin_prefetch(&slots[home], 0, 1);
+        }
     }
 
     T get_filtered(Key key, uint64_t hash, T missing) const {
@@ -367,7 +415,7 @@ public:
     }
 
     T get(Key key, T missing) const {
-        return probe(key, hash_key(key) & (slots.size() - 1), missing);
+        return probe(key, slot_hash(key) & (slots.size() - 1), missing);
     }
 
 private:

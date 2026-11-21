@@ -1,0 +1,10 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+sparse,solo,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,
+invalid_first_alias,a_canonical,1835398025001,2028-02-29T00:47:05Z,view,p_shoe,
+split_second,a_canonical,1835398020001,2028-02-29T00:47:00Z,purchase,p_shoe,125
+B5,a_canonical,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,
+B4,a_canonical,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,
+B3,a_canonical,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,
+B2,a_canonical,1835396220000,2028-02-29T00:17:00Z,purchase,p_book,200
+B1,a_canonical,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,
+B0,a_canonical,1835396220000,2028-02-29T00:17:00Z,view,p_shoe,

@@ -16,28 +16,110 @@ inputs that exceed the native record layout's timestamp or category limits.
 
 ## Native pipeline timings
 
-Each dataset contains 20 million events and five million clicks. These are
-medians of three local runs with eight Docker CPUs and 6 GB RAM, measured
-from container start to exit.
+Each dataset contains 20 million events and five million clicks. Times are
+medians of three interleaved local runs per build. Docker runs use
+eight CPUs and 6 GB RAM, measured from container start to exit. Native
+times use eight workers and include Parquet writes.
 
-| Dataset | Previous C++ image | Current image | Current runs |
-| --- | ---: | ---: | --- |
-| Seed 7 | 2.811 s | 1.956 s | 2.395, 1.956, 1.872 s |
-| Seed 37 | 2.583 s | 1.867 s | 1.991, 1.867, 1.867 s |
+| Dataset | Previous Docker | Current Docker | Previous native | Current native |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 7 | 1.413 s | 1.385 s | 1.20 s | 1.15 s |
+| Seed 37 | 1.421 s | 1.382 s | 1.16 s | 1.11 s |
 
-Both output tables matched the reference exactly on both datasets. The
-native writer produced about 23–24 MiB of LZ4-compressed Parquet per dataset.
+On warm inputs, a read-only probe that touched one word per cache line
+took 0.08–0.11 s.
+The CSV scanner with field extraction took 0.12–0.15 s before decoding
+and validating timestamps, routing records, and computing the results.
+
+Deduplication scans 16-byte event versions. A reversible 64-bit mixer
+preserves exact IDs and lets deduplication reuse the partitioning hash.
+The pipeline groups event payloads and clicks together by raw user, then
+resolves the canonical identity once per raw user. Each session worker
+writes its own user Parquet part as it finishes daily summaries. A wide
+event layout or ingest timestamp falls back to the reference SQL pipeline.
+
+For people with at least 16 events, the session workers collect 30-minute
+bins across their linked IDs. Events within a bin are connected by the
+gap rule. Comparing the last event of a bin with the first of the next
+occupied bin gives the same session boundaries as sorting every event.
+The workers retain event counts and purchases, and assign each session
+to the UTC day of its first event. Smaller timelines are sorted directly.
+[The Dataflow Model](https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf)
+
+The CSV reader scans newline, comma, and quote bytes together with AVX2
+for short rows and aligns chunk boundaries in the reader threads. Event
+readers sample the input density to reserve bucket capacity. The
+implementation uses the structural-byte approach also used by simdjson
+and the same allocation principle described in Polaris's ingestion trace.
+[simdjson paper](https://arxiv.org/abs/1902.08318) ·
+[Polaris ingestion trace](https://github.com/enkyuan/polaris/blob/9f20a22bef0446b2000c2e26b6829e63cbe486fe/PERFORMANCE.md#trace-guided-ingestion-changes)
+
+All 37 fixtures passed and both output tables matched the reference exactly
+on the public 1M dataset and both 20M datasets. The native writer produced
+about 23–24 MiB of LZ4-compressed Parquet per 20M dataset.
 Set `SHOPPING_PROFILE=1` to print stage timings and peak process RSS to stderr.
+
+### Memory-access experiments
+
+Packing event payloads into 12 bytes with purchase details in a side array
+saved about 70–90 MiB of peak RSS in pinned trials. The layout added time to
+both total medians. [Materialization Strategies in a Column-Oriented DBMS](https://www.cs.umd.edu/~abadi/papers/abadiicde2007.pdf)
+
+Grouped prefetching of 16 click identity lookups reduced the median
+parse-and-link stage by 19 ms on seed 7 and 37 ms on seed 37. In five
+interleaved runs per build with the same compiler, total medians moved
+from 1.367 to 1.368 s and from 1.368 to 1.348 s, respectively. Both
+datasets matched the reference.
+[Asynchronous Memory Access Chaining](https://www.vldb.org/pvldb/vol9/p252-kocberber.pdf)
+
+Reducing event buckets from 256 to 128 made deduplication slower on both
+seeds. Reducing person buckets from 512 to 128 lowered some parsing
+times and made grouping and sessionization slower.
+[Polaris partition experiments](https://github.com/enkyuan/polaris/blob/9f20a22bef0446b2000c2e26b6829e63cbe486fe/OPTIMIZATION_RESEARCH.md#prototype-results)
+
+Transparent huge pages lowered the fault count in some event-buffer trials.
+The slowest trial took 2.50 s wall time and 9.14 s of system CPU time as
+the host's compaction counter rose. Keeping CSV offsets for ingest dates
+cut some decoding work and raised deduplication time to 0.13–0.15 s when
+the duplicate comparisons returned to the mapped text.
+[Linux transparent huge-page documentation](https://kernel.org/doc/html/latest/admin-guide/mm/transhuge.html)
+
+A preliminary scan of event IDs added about 0.4 s on both 20M inputs.
+Moving ingest order into payloads reduced version records from 16 to 12
+bytes, with mixed total timings. Aggregating during raw-user routing
+reduced roughly 19.6 million events to 6.3 million cells. On the repeat,
+the added grouping time exceeded the savings in sessionization.
+
+### Compiler experiment
+
+GCC profile-guided optimization was trained on the public 1M and a separate
+5M dataset. The table gives medians of three warmed, interleaved native
+eight-worker runs per build. Both 20M evaluation datasets matched exactly.
+
+| Dataset | GCC -O3 | GCC -O3 with PGO |
+| --- | ---: | ---: |
+| Seed 7 | 1.15 s | 1.07 s |
+| Seed 37 | 1.11 s | 1.05 s |
+
+Use GCC and existing training data to build the profiled local executable.
+The target installs it after training and compilation succeed.
+
+```sh
+make native-profiled PGO_DATA=dev PGO_EXTRA_DATA=/path/to/training-5m
+```
+
+`PGO_EXTRA_DATA` is optional. Run `make -B native-engine` to rebuild the
+regular executable. The Docker build uses `-O3 -march=x86-64-v3` on amd64.
 
 ## Run and test locally
 
 You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
 
-Build the image and run all 36 fixtures:
+Build the image and run all 37 fixtures, including the leap-day session case.
 
 ```sh
 make build        # docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
-make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
+make fixtures     # runs the image with scorer flags and diffs each case against expected/
 ```
 
 Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
@@ -118,5 +200,5 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 - `pipeline/native_output.hpp` writes typed Parquet directly from C++.
 - `pipeline/pipeline.py` is the reference SQL pipeline.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
-- `fixtures/` holds the 36 edge cases, each with an `input/` folder and the `expected/` tables.
+- `fixtures/` holds the edge cases, each with an `input/` folder and the `expected/` tables.
 - `scripts/` runs your image the way the scorer does and diffs the output.
