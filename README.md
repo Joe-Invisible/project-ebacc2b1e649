@@ -1,16 +1,33 @@
-# Shopping Sessions: DuckDB pipeline
+# Shopping Sessions
 
 The pipeline reads the challenge CSVs, resolves linked IDs, and writes the
 `user_daily` and `campaign_daily` Parquet tables. See [rules.md](rules.md) for
 the input dialect and output definitions.
 
-The container builds a C++20 input parser and runs it across input parts in
-parallel. The parser validates CSV rows and converts timestamps to epoch
-milliseconds in one pass. DuckDB handles deduplication, sessionization,
-attribution, and output.
-Click coverage is merged per person and campaign before counting assists, so
-overlapping clicks do not multiply intermediate session matches. For the SQL
-and C++ window comparisons, see [the sessionization benchmarks](experiments/README.md).
+The container runs a C++20 pipeline. It reads CSV parts in parallel, builds
+the linked-ID graph concurrently, and deduplicates events by exact ID before
+validation can drop the earliest copy. Compact per-person timelines drive
+sessionization and seven-day click attribution. Each worker writes its own
+LZ4-compressed Parquet output through the native writer.
+
+The source includes the original DuckDB SQL pipeline for reference and for
+inputs that exceed the native record layout's timestamp or category limits.
+[Earlier SQL and DuckDB window benchmark notes](experiments/README.md)
+
+## Native pipeline timings
+
+Each dataset contains 20 million events and five million clicks. These are
+medians of three local runs with eight Docker CPUs and 6 GB RAM, measured
+from container start to exit.
+
+| Dataset | Previous C++ image | Current image | Current runs |
+| --- | ---: | ---: | --- |
+| Seed 7 | 2.811 s | 1.956 s | 2.395, 1.956, 1.872 s |
+| Seed 37 | 2.583 s | 1.867 s | 1.991, 1.867, 1.867 s |
+
+Both output tables matched the reference exactly on both datasets. The
+native writer produced about 23–24 MiB of LZ4-compressed Parquet per dataset.
+Set `SHOPPING_PROFILE=1` to print stage timings and peak process RSS to stderr.
 
 ## Run and test locally
 
@@ -39,9 +56,18 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 - **x86 Linux and Windows machines.** Build and run the amd64 image natively.
 - **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
 
-To iterate without Docker, install the engine and checker dependencies.
-`make native` builds the fast normalizer with a C++20 compiler. The direct
-Python entry point also works without that build.
+To build and check the native pipeline without Docker, use a C++20 compiler,
+the Linux LZ4 runtime (`liblz4.so.1`), and the checker dependencies.
+
+```sh
+make native-engine
+pip install -r requirements.txt polars
+export SCRATCH_DIR=${TMPDIR:-/tmp}
+python3 scripts/run_fixtures.py fixtures -- python3 pipeline/launch.py
+```
+
+The reference SQL pipeline can also be tested directly. `make native` builds
+its optional C++20 normalizer.
 
 ```sh
 pip install -r requirements.txt polars
@@ -86,8 +112,11 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` runs the DuckDB pipeline.
-- `pipeline/normalize.cpp` parses CSV input parts and converts timestamps.
+- `pipeline/launch.py` reads the manifest and starts the native pipeline.
+- `pipeline/native.cpp` handles deduplication, linked identities, sessions, and attribution.
+- `pipeline/native_input.hpp` maps and parses the CSV input and encodes IDs.
+- `pipeline/native_output.hpp` writes typed Parquet directly from C++.
+- `pipeline/pipeline.py` is the reference SQL pipeline.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each with an `input/` folder and the `expected/` tables.
 - `scripts/` runs your image the way the scorer does and diffs the output.

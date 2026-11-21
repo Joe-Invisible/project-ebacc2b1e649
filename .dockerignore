@@ -4,3 +4,4 @@ out/
 *.md
 .git
 pipeline/normalize
+pipeline/native_pipeline

@@ -1,8 +1,6 @@
+#include "timestamp.hpp"
+
 #include <array>
-#include <charconv>
-#include <chrono>
-#include <cstdint>
-#include <optional>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -33,73 +31,6 @@ bool parse(std::string_view line, std::array<std::string_view, max_fields>& fiel
         }
     }
     return !fields[0].empty();
-}
-
-// Unlike the general CSV fields, timestamps contain only ASCII syntax.
-int digits(std::string_view part) {
-    int number = 0;
-    for (char byte : part) {
-        if (byte < '0' || byte > '9') {
-            return -1;
-        }
-        number = number * 10 + (byte - '0');
-    }
-    return number;
-}
-
-std::optional<std::int64_t> timestamp_ms(std::string_view field) {
-    constexpr std::int64_t second_ms = 1000;
-    constexpr std::int64_t day_ms = 86400 * second_ms;
-    if (field.empty() || field.front() < '0' || field.front() > '9') {
-        return std::nullopt;
-    }
-    if (field.size() < 5 || field[4] != '-') {
-        std::int64_t value = 0;
-        auto result = std::from_chars(field.data(), field.data() + field.size(), value);
-        if (result.ec == std::errc{} && result.ptr == field.data() + field.size()) {
-            return value;
-        }
-        return std::nullopt;
-    }
-
-    if ((field.size() != 20 && field.size() != 25) || field[7] != '-' ||
-        field[10] != 'T' || field[13] != ':' || field[16] != ':') {
-        return std::nullopt;
-    }
-    const int year = digits(field.substr(0, 4));
-    const int month = digits(field.substr(5, 2));
-    const int day = digits(field.substr(8, 2));
-    const int hour = digits(field.substr(11, 2));
-    const int minute = digits(field.substr(14, 2));
-    const int second = digits(field.substr(17, 2));
-    if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
-        return std::nullopt;
-    }
-    const std::chrono::year_month_day date{
-        std::chrono::year(year), std::chrono::month(month), std::chrono::day(day)};
-    if (!date.ok()) {
-        return std::nullopt;
-    }
-
-    int offset_minutes = 0;
-    if (field.size() == 20) {
-        if (field[19] != 'Z') {
-            return std::nullopt;
-        }
-    } else {
-        const char sign = field[19];
-        const int hours = digits(field.substr(20, 2));
-        const int minutes = digits(field.substr(23, 2));
-        if ((sign != '+' && sign != '-') || field[22] != ':' ||
-            hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
-            return std::nullopt;
-        }
-        offset_minutes = (hours * 60 + minutes) * (sign == '-' ? -1 : 1);
-    }
-
-    const auto days = std::chrono::sys_days(date).time_since_epoch().count();
-    return days * day_ms + ((hour * 60 + minute - offset_minutes) * 60 + second) * second_ms;
 }
 
 bool is_timestamp(std::size_t width, std::size_t index) {

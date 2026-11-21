@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: DuckDB
+Engine: Native C++20

@@ -1,4 +1,5 @@
 /pipeline/normalize
+/pipeline/native_pipeline
 /pipeline/__pycache__/
 /experiments/__pycache__/
 /scripts/__pycache__/

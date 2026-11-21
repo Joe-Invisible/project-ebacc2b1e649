@@ -8,7 +8,7 @@ DEV   ?= dev
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build native fixtures dev run-dev check-dev
+.PHONY: build native native-engine fixtures dev run-dev check-dev
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
@@ -17,8 +17,15 @@ build:
 ## Build the CSV normalizer for direct local runs
 native: pipeline/normalize
 
-pipeline/normalize: pipeline/normalize.cpp
+pipeline/normalize: pipeline/normalize.cpp pipeline/timestamp.hpp
 	$(CXX) $(CXXFLAGS) -std=c++20 -O3 -DNDEBUG $< -o $@
+
+## Build the native submission locally
+NATIVE_ARCH ?= $(if $(filter x86_64,$(shell uname -m)),-march=x86-64-v3)
+native-engine: pipeline/native_pipeline
+
+pipeline/native_pipeline: pipeline/native.cpp pipeline/native_input.hpp pipeline/native_output.hpp pipeline/timestamp.hpp
+	$(CXX) $(CXXFLAGS) -std=c++20 -O3 -DNDEBUG $(NATIVE_ARCH) -pthread $< -Wl,-l:liblz4.so.1 -o $@
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build
