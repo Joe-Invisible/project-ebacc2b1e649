@@ -12,6 +12,8 @@
 #include <sys/resource.h>
 #include <type_traits>
 
+extern "C" void sampler_dump() __attribute__((weak));
+
 namespace shopping {
 constexpr int64_t day_ms = 86400000;
 constexpr int64_t week_ms = 7 * day_ms;
@@ -107,10 +109,11 @@ public:
         if (tail) std::memcpy(rows + used - tail, line, tail * sizeof(T));
     }
 
+    // Return the pages concurrently with other workers. Freeing would unmap
+    // under the exclusive address-space lock or leave pages for process exit.
     void release() {
-        std::free(rows);
-        rows = nullptr;
-        used = capacity = 0;
+        discard_memory(rows, capacity * sizeof(T));
+        used = 0;
     }
 };
 #else
@@ -476,6 +479,7 @@ struct TimelineSpan {
 struct TimelineStorage {
     std::array<std::unique_ptr<TimelineEvent[]>, person_bucket_count> events;
     std::array<std::unique_ptr<TimelineClick[]>, person_bucket_count> clicks;
+    std::array<size_t, person_bucket_count> event_counts{}, click_counts{};
 };
 using SpanPartitions = std::vector<PersonBuckets<TimelineSpan>>;
 
@@ -539,6 +543,8 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawCl
         // The per-ID counts give disjoint spans that the two scatter loops fill.
         event_timeline = std::make_unique_for_overwrite<TimelineEvent[]>(event_offset);
         click_timeline = std::make_unique_for_overwrite<TimelineClick[]>(click_offset);
+        storage.event_counts[bucket] = event_offset;
+        storage.click_counts[bucket] = click_offset;
         size_t row = 0;
         for (auto& feed : payloads.rows) {
             for (const auto& event : feed[bucket]) {
@@ -552,7 +558,7 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawCl
             for (const auto& click : feed[bucket]) {
                 click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id, click.ts, click.campaign};
             }
-            std::vector<RawClick>().swap(feed[bucket]);
+            discard_memory(feed[bucket].data(), feed[bucket].capacity() * sizeof(RawClick));
         }
     });
 }
@@ -820,9 +826,20 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
 int run(const fs::path& input, const fs::path& output, int64_t start, int64_t end, size_t workers) {
     auto last = std::chrono::steady_clock::now();
     const bool profile = std::getenv("SHOPPING_PROFILE");
+    profile_workers = profile;
+    long last_faults = 0;
+    double last_system = 0;
     auto mark = [&](const char* stage) {
         auto now = std::chrono::steady_clock::now();
-        if (profile) std::cerr << stage << ": " << std::chrono::duration<double>(now - last).count() << " s\n";
+        if (profile) {
+            struct rusage usage {};
+            getrusage(RUSAGE_SELF, &usage);
+            const double system = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+            std::cerr << stage << ": " << std::chrono::duration<double>(now - last).count() << " s, "
+                      << usage.ru_minflt - last_faults << " faults, " << system - last_system << " s system\n";
+            last_faults = usage.ru_minflt;
+            last_system = system;
+        }
         last = now;
     };
     Keys keys;
@@ -834,7 +851,8 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     EventPayloads payloads(workers);
     std::vector<PersonBuckets<RawClick>> clicks(workers);
     {
-        MappedInput event_input, click_input;
+        auto inputs = std::make_unique<std::array<MappedInput, 2>>();
+        auto& [event_input, click_input] = *inputs;
         event_input.folder(input / "events", input_chunk);
         click_input.folder(input / "clicks", input_chunk);
         std::vector<EventBuckets> events(workers);
@@ -859,6 +877,13 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
         mark("parse and link");
+        // A serial munmap of the inputs takes tens of milliseconds in the
+        // kernel. Dropping the pages in parallel leaves only empty mappings.
+        parallel(workers, workers, [&](size_t, size_t task) {
+            event_input.discard(task, workers);
+            click_input.discard(task, workers);
+        });
+        mark("drop inputs");
         deduplicate(events, workers, payloads);
         mark("event dedup");
     }
@@ -888,9 +913,20 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     }
     write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
     mark("campaign Parquet");
+    // Process exit frees the remaining pages on one thread. Release the
+    // large timelines in parallel first.
+    parallel(workers, person_bucket_count, [&](size_t, size_t bucket) {
+        discard_memory(storage.events[bucket].get(), storage.event_counts[bucket] * sizeof(TimelineEvent));
+        discard_memory(storage.clicks[bucket].get(), storage.click_counts[bucket] * sizeof(TimelineClick));
+    });
+    mark("release memory");
     if (profile) {
         struct rusage usage {};
         if (getrusage(RUSAGE_SELF, &usage) == 0) std::cerr << "peak RSS: " << usage.ru_maxrss << " KiB\n";
+        std::ifstream status("/proc/self/status");
+        for (std::string line; std::getline(status, line);) {
+            if (line.starts_with("Rss")) std::cerr << line << '\n';
+        }
     }
     // The writers have closed their files and joined. Let the kernel reclaim
     // the remaining in-memory result buffers in this one-shot executable.
@@ -898,6 +934,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     // GCC writes its profile through an exit handler.
     std::exit(0);
 #else
+    if (sampler_dump) sampler_dump();
     std::_Exit(0);
 #endif
 }

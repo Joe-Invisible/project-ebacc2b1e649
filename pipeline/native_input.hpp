@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -191,6 +193,17 @@ bool split(std::string_view line, std::array<std::string_view, Width>& fields) {
     return !fields[0].empty();
 }
 
+// Return the whole pages inside a buffer to the kernel. The buffer stays
+// valid (it reads back as zeros), so it may still be freed or reused later.
+// Unlike munmap, this takes the address-space lock shared, so workers can
+// release memory concurrently.
+inline void discard_memory(const void* data, size_t bytes) {
+    constexpr uintptr_t page = 4096;
+    const auto first = (reinterpret_cast<uintptr_t>(data) + page - 1) & ~(page - 1);
+    const auto last = (reinterpret_cast<uintptr_t>(data) + bytes) & ~(page - 1);
+    if (last > first) madvise(reinterpret_cast<void*>(first), last - first, MADV_DONTNEED);
+}
+
 struct Part {
     const char* first;
     const char* end;
@@ -215,6 +228,12 @@ class MappedInput {
     std::vector<Part> mappings;
 
 public:
+    // Drop the mapped pages of every task-th file, starting at index.
+    void discard(size_t index, size_t tasks) const {
+        for (size_t file = index; file < mappings.size(); file += tasks) {
+            discard_memory(mappings[file].first, mappings[file].end - mappings[file].first);
+        }
+    }
     std::vector<Part> parts;
     MappedInput() = default;
     MappedInput(const MappedInput&) = delete;
@@ -307,8 +326,12 @@ void read_part(Part part, Function&& visit) {
     }
 }
 
+inline bool profile_workers = false;
+
 template <class Function>
 void parallel(size_t workers, size_t count, Function&& work) {
+    const auto began = std::chrono::steady_clock::now();
+    std::vector<double> finished(std::min(workers, count));
     std::atomic<size_t> next{0};
     std::atomic<bool> failed{false};
     std::mutex error_mutex;
@@ -318,6 +341,7 @@ void parallel(size_t workers, size_t count, Function&& work) {
             for (size_t task; !failed && (task = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
                 work(worker, task);
             }
+            finished[worker] = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         } catch (...) {
             std::lock_guard lock(error_mutex);
             if (!error) error = std::current_exception();
@@ -328,6 +352,10 @@ void parallel(size_t workers, size_t count, Function&& work) {
     for (size_t worker = 1; worker < std::min(workers, count); ++worker) threads.emplace_back(run, worker);
     run(0);
     threads.clear();
+    if (profile_workers && finished.size() > 1) {
+        auto [low, high] = std::minmax_element(finished.begin(), finished.end());
+        fprintf(stderr, "  parallel(%zu tasks): first worker done %.3f s, last %.3f s\n", count, *low, *high);
+    }
     if (error) std::rethrow_exception(error);
 }
 
