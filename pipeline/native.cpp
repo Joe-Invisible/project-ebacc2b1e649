@@ -450,7 +450,7 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                     const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
                     if (order > UINT32_MAX) throw WideEventLayout{};
                     EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
-                    auto ts = timestamp_ms(fields[2]);
+                    auto ts = event_timestamp_ms(fields[2], fields[3], ingest);
                     if (ts && *ts >= start && *ts < end && ingest * 1000 - *ts <= day_ms &&
                         !fields[1].empty() && !fields[5].empty()) {
                         const auto offset = static_cast<uint32_t>(*ts - start);

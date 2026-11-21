@@ -2,6 +2,7 @@
 
 #include <array>
 #include <charconv>
+#include <cstring>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -118,3 +119,21 @@ inline std::optional<int64_t> timestamp_ms(std::string_view field) {
 inline int64_t ingest_seconds(std::string_view field) {
     return time_detail::civil_seconds(time_detail::decode_clock<false>(field.data()));
 }
+
+// Parses an event ts given its row's ingest_ts, which is always valid F1.
+// When ts is F1 on the same calendar date, that date is already known to be
+// valid, so only the time of day is decoded and checked.
+inline std::optional<int64_t> event_timestamp_ms(std::string_view field, std::string_view ingest,
+                                                 int64_t ingest_seconds) {
+    if (field.size() == 20 && field[19] == 'Z' && std::memcmp(field.data(), ingest.data(), 11) == 0) {
+        using time_detail::pair;
+        const char* p = field.data();
+        const int hour = pair(p + 11), minute = pair(p + 14), second = pair(p + 17);
+        if (p[13] != ':' || p[16] != ':' || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+            second < 0 || second > 59) return std::nullopt;
+        const int64_t ingest_of_day = ((ingest_seconds % 86400) + 86400) % 86400;
+        return (ingest_seconds - ingest_of_day + hour * 3600 + minute * 60 + second) * 1000;
+    }
+    return timestamp_ms(field);
+}
+
