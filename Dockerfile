@@ -12,7 +12,13 @@ RUN set -eu; \
     esac; \
     g++ -std=c++20 -O3 -DNDEBUG normalize.cpp -o /normalize; \
     g++ -std=c++20 -O3 -DNDEBUG $cpu $pgo -pthread -c native.cpp -o native.o; \
-    g++ -pthread native.o -Wl,-l:liblz4.so.1 -o /native_pipeline
+    g++ -pthread native.o -Wl,-l:liblz4.so.1 -o /native_pipeline; \
+    if [ "$TARGETARCH" = amd64 ]; then \
+        g++ -std=c++20 -O3 -DNDEBUG -march=x86-64-v4 -mprefer-vector-width=256 $pgo -pthread -c native.cpp -o native-v4.o; \
+        g++ -pthread native-v4.o -Wl,-l:liblz4.so.1 -o /native_pipeline_avx512; \
+    else \
+        cp /native_pipeline /native_pipeline_avx512; \
+    fi
 
 FROM python:3.12-slim-bookworm
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
@@ -20,7 +26,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
-COPY --from=build /normalize /native_pipeline /app/pipeline/
+COPY --from=build /normalize /native_pipeline /native_pipeline_avx512 /app/pipeline/
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
