@@ -260,7 +260,7 @@ void read_part(Part part, Function&& visit) {
     part = align_part(part);
     std::array<std::string_view, Width> fields;
 #ifdef __AVX2__
-    if constexpr (Width >= 4) {
+    if constexpr (Width >= 2) {
         const auto comma = _mm256_set1_epi8(',');
         const auto quote = _mm256_set1_epi8('"');
         const auto newline = _mm256_set1_epi8('\n');
@@ -352,24 +352,12 @@ public:
         slots.resize(capacity);
     }
 
+    size_t capacity() const noexcept { return slots.size(); }
+
     void insert(Key key, T value) {
         size_t slot = slot_hash(key) & (slots.size() - 1);
         while (slots[slot].key && slots[slot].key != key) slot = (slot + 1) & (slots.size() - 1);
         slots[slot] = {key, value};
-    }
-
-    // The graph supplies each key once. Readers begin after all writers join.
-    void insert_distinct_concurrently(Key key, T value) {
-        size_t slot = slot_hash(key) & (slots.size() - 1);
-        for (;;) {
-            Key empty = 0;
-            if (std::atomic_ref<Key>(slots[slot].key).compare_exchange_strong(
-                    empty, key, std::memory_order_relaxed)) {
-                slots[slot].value = value;
-                return;
-            }
-            slot = (slot + 1) & (slots.size() - 1);
-        }
     }
 
     T find_or_insert(Key key, T value) {
@@ -393,12 +381,14 @@ public:
         }
     }
 
-    void index_homes() {
+    template<class Update>
+    void index_updated_values(Update update) {
         occupied_homes.assign((slots.size() + 63) / 64, 0);
-        for_each([&](Key key, T) {
-            size_t home = slot_hash(key) & (slots.size() - 1);
+        for (auto& slot : slots) {
+            if (!slot.key || !update(slot.value)) continue;
+            const auto home = slot_hash(slot.key) & (slots.size() - 1);
             occupied_homes[home / 64] |= uint64_t{1} << (home % 64);
-        });
+        }
     }
 
     void prefetch_filtered(uint64_t hash) const {

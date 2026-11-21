@@ -16,9 +16,9 @@ inputs that exceed the native record layout's timestamp or category limits.
 
 ## Native pipeline timings
 
-Each dataset contains 20 million events and five million clicks. Times are
-medians of three interleaved local runs per build. Docker runs use
-eight CPUs and 6 GB RAM, measured from container start to exit. Native
+Each dataset contains 20 million events and five million clicks. The time-bin
+release timings below are medians of three interleaved local runs per build.
+Docker runs use eight CPUs and 6 GB RAM, measured from container start to exit. Native
 times use eight workers and include Parquet writes.
 
 | Dataset | Previous Docker | Current Docker | Previous native | Current native |
@@ -90,11 +90,95 @@ bytes, with mixed total timings. Aggregating during raw-user routing
 reduced roughly 19.6 million events to 6.3 million cells. On the repeat,
 the added grouping time exceeded the savings in sessionization.
 
+### SIMD experiments
+
+These are medians of five interleaved scans on the local Ryzen 5900HX with
+eight workers. The timestamp probe used about 2.65 million real rows per
+seed. The duplicate candidate probe scanned the full version stream
+against an existing repeat bitmap.
+
+| Kernel | Seed 7 baseline | Seed 7 AVX2 | Seed 37 baseline | Seed 37 AVX2 |
+| --- | ---: | ---: | ---: | ---: |
+| Decode event and ingest timestamps | 10.44 ms | 10.26 ms | 9.73 ms | 11.67 ms |
+| Filter eight duplicate candidates per vector | 13.01 ms | 13.25 ms | 12.79 ms | 12.76 ms |
+
+The full-pipeline prototypes matched both 20M references. Vector scans
+of 16 or 32 hash-table tags also gave mixed total timings. The tag probe
+checked full keys on every tag match.
+[Abseil hash-table design notes](https://abseil.io/about/design/swisstables)
+
+### Linked-ID graph
+
+The graph builder partitions endpoints into 64 hash buckets, assigns each
+distinct ID a dense node number, and reuses the same lookup tables to map
+aliases to their representatives. It uses one worker while the other workers
+parse events. Path halving shortens repeated root lookups, and each union
+keeps the byte-wise smallest ID at the root.
+
+These are medians of three warmed runs per build with eight workers. The
+comparison alternated build order. The Docker image uses the standard GCC
+build. The native PGO builds used the same 1M and 5M training inputs.
+
+| Dataset | Original Docker | Partitioned Docker | Original native PGO | Partitioned native PGO |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 7 | 1.529 s | 1.409 s | 1.11 s | 1.02 s |
+| Seed 37 | 1.446 s | 1.404 s | 1.05 s | 1.05 s |
+
+The fastest partitioned native run took 0.98 s. Parsing events and clicks
+and building the graph together took about 0.52 s at the median with PGO.
+
+### CSV scanning and event staging
+
+The row-based AVX2 scanner also reads two-column links and dimensions. The
+32-byte rolling, 64-byte rolling, and tiled scanners reused masks across rows.
+On the warmed field-extraction probe, their medians were 118–142 ms on seed 7
+and 119–129 ms on seed 37. The row-based scanner took 104 ms and 101 ms,
+respectively. The probe extracted fields and skipped timestamp conversion and
+staging. [simdcsv's block-mask implementation](https://github.com/minio/simdcsv)
+
+The x86 build buffers four 16-byte event records per cache line before writing
+them to the staged arrays with non-temporal stores. Each reader flushes its
+partial lines and fences the stores before deduplication starts. The scalar
+build uses vectors for the staged arrays. [Software write-combining in radix sort](https://arxiv.org/abs/1008.2849)
+
+These are medians of three warmed local trials per build with eight workers.
+The new build includes both streamed event buffers and the AVX2 link reader.
+
+| Dataset | Native parse and link | Native end to end | Native PGO end to end | Docker end to end |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 7 | 0.549 to 0.501 s | 1.05 to 1.01 s | 0.99 to 0.97 s | 1.448 to 1.448 s |
+| Seed 37 | 0.531 to 0.488 s | 1.03 to 1.00 s | 0.99 to 0.99 s | 1.512 to 1.426 s |
+
+The fastest profiled run took 0.91 s on seed 37. The profiled parse-and-link
+medians were 0.438 s and 0.487 s for seeds 7 and 37.
+
+### Grouping and attribution experiments
+
+The compact grouping prototype used four-byte hash slots containing a group
+number and a hash fingerprint. Matches still compared the complete reversible
+hash. Canonical users with no incoming alias spans skipped insertion into the
+second grouping table. The prototype matched the reference on both 20M inputs
+and on a stress case with 3,500 users in one partition and over 9,000 clicks on
+a linked person.
+[DuckDB's grouped aggregation design](https://duckdb.org/2022/03/07/aggregate-hashtable)
+
+| Dataset | Current PGO median | Compact PGO median | Current repeat | Compact repeat |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 7 | 0.99 s | 0.98 s | 1.00 s | 1.02 s |
+| Seed 37 | 1.03 s | 0.98 s | 1.03 s | 0.98 s |
+
+The first comparison used three warmed runs per build and the repeat used
+two. The fastest exact prototype run took 0.95 s on seed 37. Fusing grouping
+and sessionization for unlinked users and using radix sorting for large
+click timelines saved tens of milliseconds at most in full-pipeline runs.
+The pipeline keeps the existing grouping and click-sorting paths.
+
 ### Compiler experiment
 
-GCC profile-guided optimization was trained on the public 1M and a separate
-5M dataset. The table gives medians of three warmed, interleaved native
-eight-worker runs per build. Both 20M evaluation datasets matched exactly.
+For the time-bin release, GCC profile-guided optimization was trained on the
+public 1M and a separate 5M dataset. The table gives medians of three warmed,
+interleaved native eight-worker runs per build. Both 20M evaluation datasets
+matched exactly.
 
 | Dataset | GCC -O3 | GCC -O3 with PGO |
 | --- | ---: | ---: |
