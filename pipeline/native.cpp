@@ -60,13 +60,23 @@ class EventBuffer {
 
     T* rows = nullptr;
     size_t used = 0, capacity = 0;
+    bool owned = true;
     alignas(64) T line[rows_per_line];
 
 public:
     EventBuffer() = default;
     EventBuffer(const EventBuffer&) = delete;
     EventBuffer& operator=(const EventBuffer&) = delete;
-    ~EventBuffer() { std::free(rows); }
+    ~EventBuffer() {
+        if (owned) std::free(rows);
+    }
+
+    // Use 64-byte aligned memory owned by an Arena until the buffer outgrows it.
+    void attach(T* memory, size_t rows_capacity) {
+        rows = memory;
+        capacity = rows_capacity & ~(rows_per_line - 1);
+        owned = false;
+    }
 
     size_t size() const { return used; }
     const T* begin() const { return rows; }
@@ -84,10 +94,11 @@ public:
             // Growth reads the completed lines from the old allocation.
             _mm_sfence();
             std::memcpy(allocation, rows, (used & ~(rows_per_line - 1)) * sizeof(T));
-            std::free(rows);
+            if (owned) std::free(rows);
         }
         rows = allocation;
         capacity = rounded;
+        owned = true;
     }
 
     void push_back(const T& value) {
@@ -112,7 +123,8 @@ public:
     // Return the pages concurrently with other workers. Freeing would unmap
     // under the exclusive address-space lock or leave pages for process exit.
     void release() {
-        discard_memory(rows, capacity * sizeof(T));
+        // Arena memory is reused by a later stage instead.
+        if (owned) discard_memory(rows, capacity * sizeof(T));
         used = 0;
     }
 };
@@ -120,6 +132,44 @@ public:
 template<class T>
 using EventBuffer = std::vector<T>;
 #endif
+
+// One reserved region holds the deduplication versions. Once they are
+// consumed, the grouped timelines are carved from the same region and reuse
+// the pages the versions already faulted in.
+class Arena {
+    char* base = nullptr;
+    size_t bytes = 0;
+    std::atomic<size_t> used{0};
+
+public:
+    Arena() = default;
+    Arena(const Arena&) = delete;
+    ~Arena() {
+        if (base) munmap(base, bytes);
+    }
+    void reserve(size_t size) {
+        size = (size + 4095) & ~size_t{4095};
+        auto memory = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (memory == MAP_FAILED) return;
+        base = static_cast<char*>(memory);
+        bytes = size;
+    }
+    // Returns 64-byte aligned memory, or null once the region is full.
+    void* allocate(size_t size) {
+        if (!base) return nullptr;
+        size = (size + 63) & ~size_t{63};
+        const auto offset = used.fetch_add(size, std::memory_order_relaxed);
+        return offset + size <= bytes ? base + offset : nullptr;
+    }
+    // Start over once nothing allocated so far is needed.
+    void reset() { used.store(0, std::memory_order_relaxed); }
+    void discard(size_t index, size_t tasks) const {
+        const auto slice = (bytes / tasks + 4095) & ~size_t{4095};
+        const auto first = std::min(bytes, index * slice);
+        const auto last = std::min(bytes, first + slice);
+        if (last > first) madvise(base + first, last - first, MADV_DONTNEED);
+    }
+};
 
 template<class T>
 using PersonBuckets = std::array<std::vector<T>, person_bucket_count>;
@@ -329,11 +379,15 @@ size_t estimate_event_count(const MappedInput& mapped) {
 }
 
 void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64_t end,
-                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads) {
+                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads,
+                 Arena& arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
     const auto rows_per_worker = estimate_event_count(mapped) / workers;
     const auto reserved = rows_per_worker + rows_per_worker / 8;
     const auto readers = std::min(workers, mapped.parts.size());
+    const bool reserve = reserved >= 256 * person_bucket_count;
+    const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
+    if (reserve) arena.reserve(readers * event_bucket_count * version_slot * sizeof(EventVersion));
     std::atomic<size_t> next_part{0};
     parallel(readers, readers, [&](size_t, size_t worker) {
 #ifdef __AVX2__
@@ -344,8 +398,14 @@ void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64
         } fence_on_exit;
 #endif
         try {
-            if (reserved >= 256 * person_bucket_count) {
-                for (auto& bucket : output[worker]) bucket.reserve(reserved / event_bucket_count);
+            if (reserve) {
+                for (auto& bucket : output[worker]) {
+                    if (auto* memory = arena.allocate(version_slot * sizeof(EventVersion))) {
+                        bucket.attach(static_cast<EventVersion*>(memory), version_slot);
+                    } else {
+                        bucket.reserve(version_slot);
+                    }
+                }
                 for (auto& bucket : payloads.rows[worker]) bucket.reserve(reserved / person_bucket_count);
             }
             for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
@@ -483,15 +543,17 @@ struct TimelineSpan {
     uint32_t click_offset, clicks;
 };
 struct TimelineStorage {
-    std::array<std::unique_ptr<TimelineEvent[]>, person_bucket_count> events;
-    std::array<std::unique_ptr<TimelineClick[]>, person_bucket_count> clicks;
-    std::array<size_t, person_bucket_count> event_counts{}, click_counts{};
+    std::array<TimelineEvent*, person_bucket_count> events{};
+    std::array<TimelineClick*, person_bucket_count> clicks{};
+    // Timelines that did not fit in the arena.
+    std::array<std::unique_ptr<std::byte[]>, person_bucket_count> fallback;
+    std::array<size_t, person_bucket_count> fallback_bytes{};
 };
 using SpanPartitions = std::vector<PersonBuckets<TimelineSpan>>;
 
 void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawClick>>& clicks,
                         size_t workers, const PersonAliases& aliases,
-                        TimelineStorage& storage, SpanPartitions& routed) {
+                        TimelineStorage& storage, SpanPartitions& routed, Arena& arena) {
     parallel(workers, person_bucket_count, [&](size_t worker, size_t bucket) {
         size_t event_count = 0, click_count = 0;
         for (const auto& feed : payloads.rows) event_count += feed[bucket].size();
@@ -544,13 +606,17 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<PersonBuckets<RawCl
             event_offset += range.events;
             click_offset += range.clicks;
         }
-        auto& event_timeline = storage.events[bucket];
-        auto& click_timeline = storage.clicks[bucket];
         // The per-ID counts give disjoint spans that the two scatter loops fill.
-        event_timeline = std::make_unique_for_overwrite<TimelineEvent[]>(event_offset);
-        click_timeline = std::make_unique_for_overwrite<TimelineClick[]>(click_offset);
-        storage.event_counts[bucket] = event_offset;
-        storage.click_counts[bucket] = click_offset;
+        const size_t event_bytes = (size_t{event_offset} * sizeof(TimelineEvent) + 63) & ~size_t{63};
+        const size_t bytes = event_bytes + size_t{click_offset} * sizeof(TimelineClick);
+        auto* memory = static_cast<std::byte*>(arena.allocate(bytes));
+        if (!memory) {
+            storage.fallback[bucket] = std::make_unique_for_overwrite<std::byte[]>(bytes);
+            storage.fallback_bytes[bucket] = bytes;
+            memory = storage.fallback[bucket].get();
+        }
+        auto* event_timeline = storage.events[bucket] = reinterpret_cast<TimelineEvent*>(memory);
+        auto* click_timeline = storage.clicks[bucket] = reinterpret_cast<TimelineClick*>(memory + event_bytes);
         size_t row = 0;
         for (auto& feed : payloads.rows) {
             for (const auto& event : feed[bucket]) {
@@ -710,10 +776,10 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
     std::vector<TimelineEvent> combined_events;
     std::vector<TimelineClick> combined_clicks;
     auto event_span = [&](const TimelineSpan& piece) {
-        return std::span(storage.events[piece.raw_bucket].get() + piece.event_offset, piece.events);
+        return std::span(storage.events[piece.raw_bucket] + piece.event_offset, piece.events);
     };
     auto click_span = [&](const TimelineSpan& piece) {
-        return std::span(storage.clicks[piece.raw_bucket].get() + piece.click_offset, piece.clicks);
+        return std::span(storage.clicks[piece.raw_bucket] + piece.click_offset, piece.clicks);
     };
     for (const auto& range : ranges) {
         if (!range.events) continue;
@@ -855,6 +921,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     mark("dimensions");
     // Event-ID buckets keep all revisions together, even if their user IDs differ.
     EventPayloads payloads(workers);
+    Arena arena;
     std::vector<PersonBuckets<RawClick>> clicks(workers);
     {
         auto inputs = std::make_unique<std::array<MappedInput, 2>>();
@@ -865,7 +932,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         std::atomic<size_t> next_click{0};
         if (workers == 1) {
             people = link_people(keys, input);
-            read_events(event_input, 1, start, end, keys, dims, events, payloads);
+            read_events(event_input, 1, start, end, keys, dims, events, payloads, arena);
             read_clicks(click_input, 1, start, end, keys, dims, clicks, next_click, 0);
         } else {
             std::exception_ptr link_or_click_error;
@@ -877,7 +944,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
                     link_or_click_error = std::current_exception();
                 }
             });
-            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads);
+            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena);
             read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, next_click, 1);
             resolve.join();
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
@@ -891,11 +958,12 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         });
         mark("drop inputs");
         deduplicate(events, workers, payloads);
+        arena.reset();
         mark("event dedup");
     }
     TimelineStorage storage;
     SpanPartitions spans(workers);
-    group_raw_payloads(payloads, clicks, workers, people, storage, spans);
+    group_raw_payloads(payloads, clicks, workers, people, storage, spans, arena);
     mark("group raw users");
     auto first_day = utc_day(start);
     auto day_count = utc_day(end - 1) - first_day + 1;
@@ -922,8 +990,8 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     // Process exit frees the remaining pages on one thread. Release the
     // large timelines in parallel first.
     parallel(workers, person_bucket_count, [&](size_t, size_t bucket) {
-        discard_memory(storage.events[bucket].get(), storage.event_counts[bucket] * sizeof(TimelineEvent));
-        discard_memory(storage.clicks[bucket].get(), storage.click_counts[bucket] * sizeof(TimelineClick));
+        discard_memory(storage.fallback[bucket].get(), storage.fallback_bytes[bucket]);
+        if (bucket < workers) arena.discard(bucket, workers);
     });
     mark("release memory");
     if (profile) {
