@@ -136,7 +136,17 @@ using EventBuffer = std::vector<T>;
 // One reserved region holds the deduplication versions. Once they are
 // consumed, the grouped timelines are carved from the same region and reuse
 // the pages the versions already faulted in.
+// Transparent huge pages cut page faults by 512x where the kernel can back
+// them. SHOPPING_HUGEPAGES=0 turns them off.
+inline bool use_huge_pages() {
+    const char* setting = std::getenv("SHOPPING_HUGEPAGES");
+    return !setting || std::string_view(setting) != "0";
+}
+
 class Arena {
+    static constexpr size_t huge_page = size_t{2} << 20;
+    char* mapping = nullptr;
+    size_t mapped = 0;
     char* base = nullptr;
     size_t bytes = 0;
     std::atomic<size_t> used{0};
@@ -145,14 +155,19 @@ public:
     Arena() = default;
     Arena(const Arena&) = delete;
     ~Arena() {
-        if (base) munmap(base, bytes);
+        if (mapping) munmap(mapping, mapped);
     }
     void reserve(size_t size) {
-        size = (size + 4095) & ~size_t{4095};
-        auto memory = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        size = (size + huge_page - 1) & ~(huge_page - 1);
+        // Over-allocate so the usable region starts on a huge-page boundary.
+        const auto total = size + huge_page;
+        auto memory = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (memory == MAP_FAILED) return;
-        base = static_cast<char*>(memory);
+        mapping = static_cast<char*>(memory);
+        mapped = total;
+        base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(mapping) + huge_page - 1) & ~(huge_page - 1));
         bytes = size;
+        if (use_huge_pages()) madvise(base, bytes, MADV_HUGEPAGE);
     }
     // Returns 64-byte aligned memory, or null once the region is full.
     void* allocate(size_t size) {
@@ -380,14 +395,18 @@ size_t estimate_event_count(const MappedInput& mapped) {
 
 void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64_t end,
                  Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads,
-                 Arena& arena) {
+                 Arena& arena, Arena& payload_arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
     const auto rows_per_worker = estimate_event_count(mapped) / workers;
     const auto reserved = rows_per_worker + rows_per_worker / 8;
     const auto readers = std::min(workers, mapped.parts.size());
     const bool reserve = reserved >= 256 * person_bucket_count;
     const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
-    if (reserve) arena.reserve(readers * event_bucket_count * version_slot * sizeof(EventVersion));
+    const auto payload_slot = (reserved / person_bucket_count + 3) & ~size_t{3};
+    if (reserve) {
+        arena.reserve(readers * event_bucket_count * version_slot * sizeof(EventVersion));
+        payload_arena.reserve(readers * person_bucket_count * payload_slot * sizeof(RawEvent));
+    }
     std::atomic<size_t> next_part{0};
     parallel(readers, readers, [&](size_t, size_t worker) {
 #ifdef __AVX2__
@@ -400,13 +419,23 @@ void read_events(const MappedInput& mapped, size_t workers, int64_t start, int64
         try {
             if (reserve) {
                 for (auto& bucket : output[worker]) {
+#ifdef __AVX2__
                     if (auto* memory = arena.allocate(version_slot * sizeof(EventVersion))) {
                         bucket.attach(static_cast<EventVersion*>(memory), version_slot);
-                    } else {
-                        bucket.reserve(version_slot);
+                        continue;
                     }
+#endif
+                    bucket.reserve(version_slot);
                 }
-                for (auto& bucket : payloads.rows[worker]) bucket.reserve(reserved / person_bucket_count);
+                for (auto& bucket : payloads.rows[worker]) {
+#ifdef __AVX2__
+                    if (auto* memory = payload_arena.allocate(payload_slot * sizeof(RawEvent))) {
+                        bucket.attach(static_cast<RawEvent*>(memory), payload_slot);
+                        continue;
+                    }
+#endif
+                    bucket.reserve(payload_slot);
+                }
             }
             for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
                 read_part<7>(mapped.parts[part], [&](const auto& fields) {
@@ -921,7 +950,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     mark("dimensions");
     // Event-ID buckets keep all revisions together, even if their user IDs differ.
     EventPayloads payloads(workers);
-    Arena arena;
+    Arena arena, payload_arena;
     std::vector<PersonBuckets<RawClick>> clicks(workers);
     {
         auto inputs = std::make_unique<std::array<MappedInput, 2>>();
@@ -932,7 +961,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         std::atomic<size_t> next_click{0};
         if (workers == 1) {
             people = link_people(keys, input);
-            read_events(event_input, 1, start, end, keys, dims, events, payloads, arena);
+            read_events(event_input, 1, start, end, keys, dims, events, payloads, arena, payload_arena);
             read_clicks(click_input, 1, start, end, keys, dims, clicks, next_click, 0);
         } else {
             std::exception_ptr link_or_click_error;
@@ -944,7 +973,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
                     link_or_click_error = std::current_exception();
                 }
             });
-            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena);
+            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena, payload_arena);
             read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, next_click, 1);
             resolve.join();
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
@@ -991,7 +1020,10 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     // large timelines in parallel first.
     parallel(workers, person_bucket_count, [&](size_t, size_t bucket) {
         discard_memory(storage.fallback[bucket].get(), storage.fallback_bytes[bucket]);
-        if (bucket < workers) arena.discard(bucket, workers);
+        if (bucket < workers) {
+            arena.discard(bucket, workers);
+            payload_arena.discard(bucket, workers);
+        }
     });
     mark("release memory");
     if (profile) {
