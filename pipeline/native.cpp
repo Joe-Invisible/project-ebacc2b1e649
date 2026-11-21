@@ -439,8 +439,14 @@ void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayload
 void read_clicks(const MappedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
                  const Dimensions& dims, std::vector<PersonBuckets<RawClick>>& output,
                  std::atomic<size_t>& next, size_t worker_offset) {
+    // Growing the per-bucket vectors would copy rows and touch extra pages.
+    const auto per_bucket = estimate_event_count(mapped) / output.size() / person_bucket_count;
+    const auto reserved = per_bucket + per_bucket / 4;
     parallel(workers, workers, [&](size_t, size_t group) {
         const auto worker = worker_offset + group;
+        if (reserved >= 64) {
+            for (auto& bucket : output[worker]) bucket.reserve(reserved);
+        }
         for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.parts.size();) {
             read_part<4>(mapped.parts[part], [&](const auto& fields) {
                 if (fields[1].empty() || fields[2].empty()) return;

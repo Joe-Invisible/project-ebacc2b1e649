@@ -228,10 +228,15 @@ class MappedInput {
     std::vector<Part> mappings;
 
 public:
-    // Drop the mapped pages of every task-th file, starting at index.
+    // Drop the mapped pages of every task-th chunk, starting at index.
+    // Chunk boundaries are not page aligned, so each range is widened to
+    // whole pages. Neighbouring chunks may both drop a shared page.
     void discard(size_t index, size_t tasks) const {
-        for (size_t file = index; file < mappings.size(); file += tasks) {
-            discard_memory(mappings[file].first, mappings[file].end - mappings[file].first);
+        constexpr uintptr_t page = 4096;
+        for (size_t part = index; part < parts.size(); part += tasks) {
+            const auto first = reinterpret_cast<uintptr_t>(parts[part].first) & ~(page - 1);
+            const auto last = reinterpret_cast<uintptr_t>(parts[part].end);
+            madvise(reinterpret_cast<void*>(first), last - first, MADV_DONTNEED);
         }
     }
     std::vector<Part> parts;
