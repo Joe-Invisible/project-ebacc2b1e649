@@ -45,12 +45,14 @@ struct CampaignMetrics {
 
 namespace parquet {
 // File metadata follows parquet-format/src/main/thrift/parquet.thrift.
-// Each flat column has one PLAIN data page per row group, LZ4_RAW compressed
-// unless SHOPPING_PARQUET_LZ4=0 (an experiment switch).
+// Each flat column has one PLAIN data page per row group. Pages are stored
+// uncompressed, which measured faster on the scorer's hardware: the output
+// goes to the page cache, and LZ4 cost more CPU than the extra bytes.
+// SHOPPING_PARQUET_LZ4=1 restores LZ4_RAW compression.
 inline bool compress_pages() {
     static const bool enabled = [] {
         const char* setting = std::getenv("SHOPPING_PARQUET_LZ4");
-        return !setting || std::string_view(setting) != "0";
+        return setting && std::string_view(setting) == "1";
     }();
     return enabled;
 }

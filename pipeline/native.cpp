@@ -435,9 +435,9 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
     const bool reserve = reserved >= 256 * person_bucket_count;
     const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
     const auto payload_slot = (reserved / person_bucket_count + 3) & ~size_t{3};
-    // About one event in eight has a long ID; a buffer that fills up grows.
-    const auto long_divisor = std::getenv("SHOPPING_LONG_SLOT") ? std::stoul(std::getenv("SHOPPING_LONG_SLOT")) : 4;
-    const auto long_slot = (version_slot / long_divisor + 1) & ~size_t{1};
+    // About one event in eight has a long ID, so a sixth of the row slot
+    // leaves room for variation; a buffer that fills up grows.
+    const auto long_slot = (version_slot / 6 + 1) & ~size_t{1};
     if (reserve) {
         arena.reserve(readers * event_bucket_count * (version_slot * sizeof(EventVersion) +
                                                       long_slot * sizeof(LongEventVersion)));
