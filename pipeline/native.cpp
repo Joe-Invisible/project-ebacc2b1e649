@@ -31,23 +31,28 @@ int32_t utc_day(int64_t value) {
     return value / day_ms - (value % day_ms < 0);
 }
 
-// Keep the hot deduplication stream compact. Valid payloads are stored
-// separately by raw user, and invalid versions can still win.
-struct EventVersion {
-    uint64_t id_hash;
-    uint32_t ingest;
-    uint32_t position;
-};
-static_assert(sizeof(EventVersion) == 16);
-constexpr uint32_t missing_payload = UINT32_MAX;
 struct WideEventLayout {};
-struct RawEvent {
+// One record per parsed event copy, partitioned by event ID. Invalid copies
+// are kept with ts == invalid_event because they can still win deduplication.
+struct EventRow {
+    uint64_t id_hash;
     uint64_t user_hash;
-    uint32_t ts;
+    uint32_t ingest;   // Ingest seconds relative to the parse origin.
+    uint32_t ts;       // Offset from the window start, or invalid_event.
     uint32_t purchase; // Low 24 bits are price in cents, high 8 bits are category.
+    uint32_t unused;
 };
+static_assert(sizeof(EventRow) == 32);
+// A surviving event, partitioned by person.
+struct PersonEvent {
+    uint64_t person_hash;
+    uint32_t ts;
+    uint32_t purchase;
+};
+static_assert(sizeof(PersonEvent) == 16);
+// A valid click, partitioned by person.
 struct RawClick {
-    uint64_t user_hash;
+    uint64_t person_hash;
     Key id;
     uint32_t ts; // Offset from the beginning of the click window.
     uint32_t campaign;
@@ -191,8 +196,8 @@ public:
 
 template<class T>
 using PersonBuckets = std::array<std::vector<T>, person_bucket_count>;
-using EventBuckets = std::array<EventBuffer<EventVersion>, event_bucket_count>;
-using RawEventRows = std::array<EventBuffer<RawEvent>, person_bucket_count>;
+using EventBuckets = std::array<EventBuffer<EventRow>, event_bucket_count>;
+using PersonEventRows = std::array<EventBuffer<PersonEvent>, person_bucket_count>;
 using RawClickRows = std::array<EventBuffer<RawClick>, person_bucket_count>;
 
 template<class T>
@@ -213,6 +218,10 @@ size_t bucket_from_hash(uint64_t hash) {
 struct PersonAliases {
     static constexpr size_t bucket_count = 64;
     std::array<Lookup<Key, true>, bucket_count> indexes;
+
+    void prefetch(uint64_t hash) const {
+        indexes[bucket_from_hash<bucket_count>(hash)].prefetch_filtered(hash);
+    }
 
     Key get(Key user, uint64_t hash) const {
         return indexes[bucket_from_hash<bucket_count>(hash)].get_filtered(hash, hash, user);
@@ -345,37 +354,6 @@ uint32_t parse_price(std::string_view text) {
     return result.ec == std::errc{} && result.ptr == text.data() + text.size() && value <= 10000000 ? value : 0;
 }
 
-class EventPayloads {
-    const unsigned reader_bits;
-    const uint32_t reader_mask;
-    static constexpr unsigned bucket_bits = std::bit_width(person_bucket_count - 1);
-
-public:
-    std::vector<RawEventRows> rows;
-    explicit EventPayloads(size_t readers)
-        : reader_bits(std::bit_width(readers - 1)),
-          reader_mask(reader_bits < 31 ? (uint32_t{1} << reader_bits) - 1 : 0), rows(readers) {
-        if (reader_bits + bucket_bits >= 30) throw WideEventLayout{};
-    }
-
-    uint32_t store(size_t reader, const RawEvent& row) {
-        const auto bucket = bucket_from_hash<person_bucket_count>(row.user_hash);
-        auto& partition = rows[reader][bucket];
-        if (partition.size() >= (UINT32_MAX >> (reader_bits + bucket_bits))) throw WideEventLayout{};
-        const auto token = static_cast<uint32_t>((partition.size() << (reader_bits + bucket_bits)) |
-            (bucket << reader_bits) | reader);
-        partition.push_back(row);
-        return token;
-    }
-
-    void discard(uint32_t token) {
-        // Each payload has exactly one version in one event-ID partition.
-        if (token == missing_payload) return;
-        rows[token & reader_mask][(token >> reader_bits) & (person_bucket_count - 1)]
-            [token >> (reader_bits + bucket_bits)].ts = invalid_event;
-    }
-};
-
 size_t estimate_event_count(const MappedInput& mapped) {
     size_t bytes = 0;
     for (const auto& part : mapped.parts) bytes += part.end - part.first;
@@ -398,19 +376,14 @@ size_t estimate_event_count(const MappedInput& mapped) {
 }
 
 void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end,
-                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads,
-                 Arena& arena, Arena& payload_arena) {
+                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, Arena& arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
     const auto rows_per_worker = mapped.estimate_rows(27) / workers;
     const auto reserved = rows_per_worker + rows_per_worker / 8;
     const auto readers = std::min(workers, mapped.chunks.size());
-    const bool reserve = reserved >= 256 * person_bucket_count;
-    const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
-    const auto payload_slot = (reserved / person_bucket_count + 3) & ~size_t{3};
-    if (reserve) {
-        arena.reserve(readers * event_bucket_count * version_slot * sizeof(EventVersion));
-        payload_arena.reserve(readers * person_bucket_count * payload_slot * sizeof(RawEvent));
-    }
+    const bool reserve = reserved >= 256 * event_bucket_count;
+    const auto row_slot = (reserved / event_bucket_count + 1) & ~size_t{1};
+    if (reserve) arena.reserve(readers * event_bucket_count * row_slot * sizeof(EventRow));
     std::atomic<size_t> next_part{0};
     parallel(readers, readers, [&](size_t, size_t worker) {
 #ifdef __AVX2__
@@ -424,21 +397,12 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
             if (reserve) {
                 for (auto& bucket : output[worker]) {
 #ifdef __AVX2__
-                    if (auto* memory = arena.allocate(version_slot * sizeof(EventVersion))) {
-                        bucket.attach(static_cast<EventVersion*>(memory), version_slot);
+                    if (auto* memory = arena.allocate(row_slot * sizeof(EventRow))) {
+                        bucket.attach(static_cast<EventRow*>(memory), row_slot);
                         continue;
                     }
 #endif
-                    bucket.reserve(version_slot);
-                }
-                for (auto& bucket : payloads.rows[worker]) {
-#ifdef __AVX2__
-                    if (auto* memory = payload_arena.allocate(payload_slot * sizeof(RawEvent))) {
-                        bucket.attach(static_cast<RawEvent*>(memory), payload_slot);
-                        continue;
-                    }
-#endif
-                    bucket.reserve(payload_slot);
+                    bucket.reserve(row_slot);
                 }
             }
             std::vector<char> buffer;
@@ -455,30 +419,29 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                 }
                 for (size_t row = 0; row < batched; ++row) {
                     const auto& fields = batch[row];
-                    const auto& event_id = event_ids[row];
-                    const auto& user_id = user_ids[row];
                     if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
                     const auto ingest = ingest_seconds(fields[3]);
                     const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
                     if (order > UINT32_MAX) throw WideEventLayout{};
                     auto ts = timestamp_ms(fields[2]);
-                    const auto id_hash = hash_key(keys.resolve(event_id));
-                    EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
+                    const auto id_hash = hash_key(keys.resolve(event_ids[row]));
+                    EventRow copy{id_hash, 0, static_cast<uint32_t>(order), invalid_event, 0, 0};
                     if (ts && *ts >= start && *ts < end && ingest * 1000 - *ts <= day_ms &&
                         !fields[1].empty() && !fields[5].empty()) {
                         const auto offset = static_cast<uint32_t>(*ts - start);
                         if (fields[4] == "purchase") {
-                            auto price = parse_price(fields[6]);
-                            if (price) {
+                            if (auto price = parse_price(fields[6])) {
                                 auto category = dims.products.get(keys.encode(fields[5]), 0);
-                                const auto user_hash = hash_key(keys.resolve(user_id));
-                                version.position = payloads.store(worker, {user_hash, offset, price | (category << 24)});
+                                copy.user_hash = hash_key(keys.resolve(user_ids[row]));
+                                copy.ts = offset;
+                                copy.purchase = price | (category << 24);
                             }
                         } else if (fields[4] == "view" || fields[4] == "cart") {
-                            version.position = payloads.store(worker, {hash_key(keys.resolve(user_id)), offset, 0});
+                            copy.user_hash = hash_key(keys.resolve(user_ids[row]));
+                            copy.ts = offset;
                         }
                     }
-                    output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
+                    output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(copy);
                 }
                 batched = 0;
             };
@@ -492,7 +455,6 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
             }
 #ifdef __AVX2__
             for (auto& bucket : output[worker]) bucket.flush_tail();
-            for (auto& bucket : payloads.rows[worker]) bucket.flush_tail();
 #endif
         } catch (...) {
             next_part.store(mapped.chunks.size(), std::memory_order_relaxed);
@@ -501,8 +463,53 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
     });
 }
 
-void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayloads& payloads) {
-    parallel(workers, event_bucket_count, [&](size_t, size_t bucket) {
+// Resolves each surviving event's person and routes it to a person bucket.
+// Alias lookups miss the cache, so each one is prefetched a few rows ahead.
+class PersonRouter {
+    static constexpr size_t depth = 16;
+    const PersonAliases& aliases;
+    PersonEventRows& output;
+    std::array<const EventRow*, depth> pending{};
+    size_t head = 0, count = 0;
+
+    void route(const EventRow& row) {
+        const auto user = unhash_key(row.user_hash);
+        const auto person = aliases.get(user, row.user_hash);
+        const auto hash = person == user ? row.user_hash : hash_key(person);
+        output[bucket_from_hash<person_bucket_count>(hash)].push_back({hash, row.ts, row.purchase});
+    }
+
+public:
+    PersonRouter(const PersonAliases& aliases, PersonEventRows& output) : aliases(aliases), output(output) {}
+
+    void push(const EventRow& row) {
+        aliases.prefetch(row.user_hash);
+        if (count == depth) {
+            route(*pending[head]);
+            pending[head] = &row;
+            head = (head + 1) % depth;
+        } else {
+            pending[(head + count++) % depth] = &row;
+        }
+    }
+
+    void flush() {
+        for (; count; --count, head = (head + 1) % depth) route(*pending[head]);
+        head = 0;
+    }
+};
+
+// Keeps, for each event ID, the copy with the smallest ingest time. Valid
+// winners go straight to their person's bucket.
+void deduplicate(std::vector<EventBuckets>& events, size_t workers, const PersonAliases& aliases,
+                 std::vector<PersonEventRows>& people) {
+    parallel(workers, event_bucket_count, [&](size_t worker, size_t bucket) {
+#ifdef __AVX2__
+        // Publish this task's streaming writes to the person buckets.
+        struct WriteFence {
+            ~WriteFence() { _mm_sfence(); }
+        } fence_on_exit;
+#endif
         size_t count = 0;
         for (const auto& feed : events) count += feed[bucket].size();
         if (!count) return;
@@ -510,8 +517,8 @@ void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayload
         std::vector<uint64_t> seen(homes / 64), repeated(homes / 64);
         size_t collisions = 0;
         for (const auto& feed : events) {
-            for (const auto& version : feed[bucket]) {
-                const auto home = version.id_hash & (homes - 1);
+            for (const auto& row : feed[bucket]) {
+                const auto home = row.id_hash & (homes - 1);
                 const auto bit = uint64_t{1} << (home % 64);
                 auto& word = seen[home / 64];
                 if (word & bit) {
@@ -521,46 +528,48 @@ void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayload
                 word |= bit;
             }
         }
+        // An ID whose home bit was set once has a single copy, which wins.
+        // The others keep the copy with the smallest ingest time; the table
+        // holds each ID hash next to its winner to avoid chasing pointers.
+        struct Winner {
+            uint64_t id_hash;
+            const EventRow* row;
+        };
         const size_t capacity = std::bit_ceil(std::max<size_t>(2, collisions * 4));
-        std::vector<uint32_t> index(capacity, invalid_event);
-        std::vector<const EventVersion*> winners;
-        winners.reserve(collisions * 2);
+        std::vector<Winner> winners(capacity, Winner{0, nullptr});
+        PersonRouter router(aliases, people[worker]);
         for (const auto& feed : events) {
-            for (const auto& version : feed[bucket]) {
-                const auto hash = version.id_hash;
+            for (const auto& row : feed[bucket]) {
+                const auto hash = row.id_hash;
                 const auto home = hash & (homes - 1);
-                if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) continue;
+                if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) {
+                    if (row.ts != invalid_event) router.push(row);
+                    continue;
+                }
                 auto slot = hash & (capacity - 1);
-                while (index[slot] != invalid_event && winners[index[slot]]->id_hash != version.id_hash) {
-                    slot = (slot + 1) & (capacity - 1);
-                }
-                if (index[slot] == invalid_event) {
-                    index[slot] = winners.size();
-                    winners.push_back(&version);
-                } else {
-                    auto& current = winners[index[slot]];
-                    if (version.ingest < current->ingest) {
-                        payloads.discard(current->position);
-                        current = &version;
-                    } else {
-                        payloads.discard(version.position);
-                    }
-                }
+                while (winners[slot].row && winners[slot].id_hash != hash) slot = (slot + 1) & (capacity - 1);
+                auto& winner = winners[slot];
+                if (!winner.row) winner = {hash, &row};
+                else if (row.ingest < winner.row->ingest) winner.row = &row;
             }
         }
+        for (const auto& winner : winners) {
+            if (winner.row && winner.row->ts != invalid_event) router.push(*winner.row);
+        }
+        router.flush();
         for (auto& feed : events) release_event_buffer(feed[bucket]);
     });
 }
 
-// Rows reserved for each worker's click bucket.
 size_t click_slot(const ChunkedInput& mapped, size_t workers) {
     const auto per_bucket = mapped.estimate_rows(27) / workers / person_bucket_count;
     return (per_bucket + per_bucket / 4 + 1) & ~size_t{1};
 }
 
+// Clicks are routed by person as they are parsed, so they need the linked IDs.
 void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
-                 const Dimensions& dims, std::vector<RawClickRows>& output, Arena& arena,
-                 std::atomic<size_t>& next, size_t worker_offset) {
+                 const Dimensions& dims, const PersonAliases& aliases, std::vector<RawClickRows>& output,
+                 Arena& arena, std::atomic<size_t>& next, size_t worker_offset) {
     // Growing the per-bucket buffers would copy rows and touch extra pages.
     // The arena was sized in run() for every worker's buckets.
     const auto reserved = click_slot(mapped, output.size());
@@ -593,10 +602,13 @@ void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                 if (!ts || *ts < start - week_ms || *ts >= end) return;
                 auto campaign = dims.campaigns.get(keys.encode(fields[2]), missing_campaign);
                 if (campaign == missing_campaign) return;
-                const auto hash = hash_key(keys.resolve(user_id));
-                const auto bucket = bucket_from_hash<person_bucket_count>(hash);
+                const auto user = keys.resolve(user_id);
+                const auto user_hash = hash_key(user);
+                const auto person = aliases.get(user, user_hash);
+                const auto hash = person == user ? user_hash : hash_key(person);
                 const auto offset = static_cast<uint32_t>(*ts - (start - week_ms));
-                output[worker][bucket].push_back({hash, keys.resolve(click_id), offset, campaign, 0});
+                output[worker][bucket_from_hash<person_bucket_count>(hash)].push_back(
+                    {hash, keys.resolve(click_id), offset, campaign, 0});
             });
         }
 #ifdef __AVX2__
@@ -612,110 +624,6 @@ struct TimelineClick {
     Key id;
     uint32_t ts, campaign;
 };
-struct PersonRange {
-    Key person;
-    size_t events = 0, clicks = 0;
-    uint32_t first_event = UINT32_MAX, first_click = UINT32_MAX;
-};
-
-struct TimelineSpan {
-    Key person;
-    uint32_t raw_bucket;
-    uint32_t event_offset, events;
-    uint32_t click_offset, clicks;
-};
-struct TimelineStorage {
-    std::array<TimelineEvent*, person_bucket_count> events{};
-    std::array<TimelineClick*, person_bucket_count> clicks{};
-    // Timelines that did not fit in the arena.
-    std::array<std::unique_ptr<std::byte[]>, person_bucket_count> fallback;
-    std::array<size_t, person_bucket_count> fallback_bytes{};
-};
-using SpanPartitions = std::vector<PersonBuckets<TimelineSpan>>;
-
-void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clicks,
-                        size_t workers, const PersonAliases& aliases,
-                        TimelineStorage& storage, SpanPartitions& routed, Arena& arena) {
-    parallel(workers, person_bucket_count, [&](size_t worker, size_t bucket) {
-        size_t event_count = 0, click_count = 0;
-        for (const auto& feed : payloads.rows) event_count += feed[bucket].size();
-        for (const auto& feed : clicks) click_count += feed[bucket].size();
-        if (!event_count && !click_count) return;
-        if (uint64_t{event_count} + click_count >= UINT32_MAX) throw WideEventLayout{};
-        Lookup<uint32_t, true> people((event_count + click_count) / 16 + 1);
-        struct RawUser {
-            uint64_t hash;
-            uint32_t events = 0, clicks = 0;
-            uint32_t event_cursor = 0, click_cursor = 0;
-        };
-        std::vector<RawUser> ranges;
-        std::vector<uint32_t> event_groups, click_groups;
-        event_groups.reserve(event_count);
-        click_groups.reserve(click_count);
-        auto get_group = [&](uint64_t hash) {
-            auto next = static_cast<uint32_t>(ranges.size());
-            people.reserve(next + 1);
-            auto group = people.find_or_insert(hash, next);
-            if (group == next) ranges.push_back(RawUser{.hash = hash});
-            return group;
-        };
-        for (const auto& feed : payloads.rows) {
-            for (const auto& event : feed[bucket]) {
-                if (event.ts == invalid_event) continue;
-                auto group = get_group(event.user_hash);
-                ++ranges[group].events;
-                event_groups.push_back(group);
-            }
-        }
-        for (const auto& feed : clicks) {
-            for (const auto& click : feed[bucket]) {
-                auto group = get_group(click.user_hash);
-                ++ranges[group].clicks;
-                click_groups.push_back(group);
-            }
-        }
-        // Route each raw ID once, including IDs with clicks but no events.
-        uint32_t event_offset = 0, click_offset = 0;
-        for (auto& range : ranges) {
-            const auto hash = range.hash;
-            const auto user = unhash_key(hash);
-            const auto person = aliases.get(user, hash);
-            const auto dest = bucket_from_hash<person_bucket_count>(person == user ? hash : hash_key(person));
-            routed[worker][dest].push_back({person, static_cast<uint32_t>(bucket),
-                                           event_offset, range.events, click_offset, range.clicks});
-            range.event_cursor = event_offset;
-            range.click_cursor = click_offset;
-            event_offset += range.events;
-            click_offset += range.clicks;
-        }
-        // The per-ID counts give disjoint spans that the two scatter loops fill.
-        const size_t event_bytes = (size_t{event_offset} * sizeof(TimelineEvent) + 63) & ~size_t{63};
-        const size_t bytes = event_bytes + size_t{click_offset} * sizeof(TimelineClick);
-        auto* memory = static_cast<std::byte*>(arena.allocate(bytes));
-        if (!memory) {
-            storage.fallback[bucket] = std::make_unique_for_overwrite<std::byte[]>(bytes);
-            storage.fallback_bytes[bucket] = bytes;
-            memory = storage.fallback[bucket].get();
-        }
-        auto* event_timeline = storage.events[bucket] = reinterpret_cast<TimelineEvent*>(memory);
-        auto* click_timeline = storage.clicks[bucket] = reinterpret_cast<TimelineClick*>(memory + event_bytes);
-        size_t row = 0;
-        for (auto& feed : payloads.rows) {
-            for (const auto& event : feed[bucket]) {
-                if (event.ts == invalid_event) continue;
-                event_timeline[ranges[event_groups[row++]].event_cursor++] = {event.ts, event.purchase};
-            }
-            release_event_buffer(feed[bucket]);
-        }
-        row = 0;
-        for (auto& feed : clicks) {
-            for (const auto& click : feed[bucket]) {
-                click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id, click.ts, click.campaign};
-            }
-            release_event_buffer(feed[bucket]);
-        }
-    });
-}
 
 class Attribution {
     std::vector<uint32_t> active, counts, position;
@@ -821,92 +729,113 @@ public:
     }
 };
 
-void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, size_t bucket,
-                      const Keys& keys, const Dimensions& dims, int64_t start, int32_t first_day,
+// Per-worker scratch space reused across person buckets.
+struct SummaryScratch {
+    struct Person {
+        uint64_t hash;
+        uint32_t events = 0, clicks = 0;
+        uint32_t event_cursor = 0, click_cursor = 0;
+    };
+    std::vector<Person> people;
+    std::vector<uint32_t> event_groups, click_groups;
+    std::vector<TimelineEvent> events;
+    std::vector<TimelineClick> clicks;
+    std::vector<int64_t> category_revenue;
+    std::vector<uint32_t> purchased_categories;
+    TimeBins bins;
+};
+
+void summarize_bucket(const std::vector<PersonEventRows>& event_feeds, const std::vector<RawClickRows>& click_feeds,
+                      size_t bucket, const Keys& keys, const Dimensions& dims, int64_t start, int32_t first_day,
                       Attribution& attribution, parquet::File& users,
-                      std::vector<CampaignMetrics>& campaign_days) {
-    size_t span_count = 0;
-    for (const auto& source : sources) span_count += source[bucket].size();
-    if (!span_count) return;
-    Lookup<uint32_t> people(span_count);
-    std::vector<PersonRange> ranges;
-    struct Piece { const TimelineSpan* span; uint32_t next_event, next_click; };
-    std::vector<Piece> pieces;
-    pieces.reserve(span_count);
-    for (const auto& source : sources) {
-        for (const auto& span : source[bucket]) {
-            auto next = static_cast<uint32_t>(ranges.size());
-            auto group = people.find_or_insert(span.person, next);
-            if (group == next) ranges.push_back(PersonRange{.person = span.person});
-            auto& range = ranges[group];
-            auto index = static_cast<uint32_t>(pieces.size());
-            pieces.push_back({&span, range.first_event, range.first_click});
-            if (span.events) {
-                range.first_event = index;
-                range.events += span.events;
-            }
-            if (span.clicks) {
-                range.first_click = index;
-                range.clicks += span.clicks;
+                      std::vector<CampaignMetrics>& campaign_days, SummaryScratch& scratch) {
+    size_t event_count = 0, click_count = 0;
+    for (const auto& feed : event_feeds) event_count += feed[bucket].size();
+    for (const auto& feed : click_feeds) click_count += feed[bucket].size();
+    if (!event_count) return;
+    if (uint64_t{event_count} + click_count >= UINT32_MAX) throw WideEventLayout{};
+
+    // Group the bucket's events and clicks by person with a counting scatter.
+    auto& people = scratch.people;
+    people.clear();
+    Lookup<uint32_t, true> index(event_count / 8 + 1);
+    auto group_of = [&](uint64_t hash) {
+        const auto next = static_cast<uint32_t>(people.size());
+        index.reserve(next + 1);
+        const auto group = index.find_or_insert(hash, next);
+        if (group == next) people.push_back({.hash = hash});
+        return group;
+    };
+    auto& event_groups = scratch.event_groups;
+    auto& click_groups = scratch.click_groups;
+    event_groups.resize(event_count);
+    click_groups.resize(click_count);
+    size_t row = 0;
+    for (const auto& feed : event_feeds) {
+        for (const auto& event : feed[bucket]) {
+            const auto group = group_of(event.person_hash);
+            ++people[group].events;
+            event_groups[row++] = group;
+        }
+    }
+    row = 0;
+    for (const auto& feed : click_feeds) {
+        for (const auto& click : feed[bucket]) {
+            // Clicks of people without events never credit a session.
+            const auto group = index.get(click.person_hash, UINT32_MAX);
+            if (group != UINT32_MAX) ++people[group].clicks;
+            click_groups[row++] = group;
+        }
+    }
+    uint32_t event_offset = 0, click_offset = 0;
+    for (auto& person : people) {
+        person.event_cursor = event_offset;
+        person.click_cursor = click_offset;
+        event_offset += person.events;
+        click_offset += person.clicks;
+    }
+    if (scratch.events.size() < event_offset) scratch.events.resize(event_offset);
+    if (scratch.clicks.size() < click_offset) scratch.clicks.resize(click_offset);
+    auto* timeline = scratch.events.data();
+    auto* click_timeline = scratch.clicks.data();
+    row = 0;
+    for (const auto& feed : event_feeds) {
+        for (const auto& event : feed[bucket]) {
+            timeline[people[event_groups[row++]].event_cursor++] = {event.ts, event.purchase};
+        }
+    }
+    row = 0;
+    for (const auto& feed : click_feeds) {
+        for (const auto& click : feed[bucket]) {
+            const auto group = click_groups[row++];
+            if (group != UINT32_MAX) {
+                click_timeline[people[group].click_cursor++] = {click.id, click.ts, click.campaign};
             }
         }
     }
 
-    std::vector<int64_t> category_revenue(dims.categories.size());
-    std::vector<uint32_t> purchased_categories;
-    TimeBins bins;
-    std::vector<TimelineEvent> combined_events;
-    std::vector<TimelineClick> combined_clicks;
-    auto event_span = [&](const TimelineSpan& piece) {
-        return std::span(storage.events[piece.raw_bucket] + piece.event_offset, piece.events);
-    };
-    auto click_span = [&](const TimelineSpan& piece) {
-        return std::span(storage.clicks[piece.raw_bucket] + piece.click_offset, piece.clicks);
-    };
-    for (const auto& range : ranges) {
-        if (!range.events) continue;
-        auto first = range.first_event;
-        std::span<TimelineEvent> person_events;
+    auto& category_revenue = scratch.category_revenue;
+    category_revenue.assign(dims.categories.size(), 0);
+    auto& purchased_categories = scratch.purchased_categories;
+    auto& bins = scratch.bins;
+    for (const auto& person : people) {
+        const auto key = unhash_key(person.hash);
+        // The cursors now point just past each person's slice.
+        std::span<TimelineEvent> person_events(timeline + person.event_cursor - person.events, person.events);
+        std::span<TimelineClick> person_clicks(click_timeline + person.click_cursor - person.clicks, person.clicks);
         constexpr size_t binning_threshold = 16;
-        const bool use_bins = range.events >= binning_threshold && range.events < UINT32_MAX;
+        const bool use_bins = person.events >= binning_threshold;
         if (use_bins) {
-            for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_event) {
-                bins.add(event_span(*pieces[piece].span));
-            }
+            bins.add(person_events);
         } else {
-            // Sort a single small span in place and merge linked spans as needed.
-            person_events = event_span(*pieces[first].span);
-            if (pieces[first].next_event != UINT32_MAX) {
-                combined_events.clear();
-                combined_events.reserve(range.events);
-                for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_event) {
-                    auto span = event_span(*pieces[piece].span);
-                    combined_events.insert(combined_events.end(), span.begin(), span.end());
-                }
-                person_events = std::span(combined_events);
-            }
             std::sort(person_events.begin(), person_events.end(), [](const auto& a, const auto& b) { return a.ts < b.ts; });
-        }
-        std::span<TimelineClick> person_clicks;
-        if (range.clicks) {
-            first = range.first_click;
-            person_clicks = click_span(*pieces[first].span);
-            if (pieces[first].next_click != UINT32_MAX) {
-                combined_clicks.clear();
-                combined_clicks.reserve(range.clicks);
-                for (auto piece = first; piece != UINT32_MAX; piece = pieces[piece].next_click) {
-                    auto span = click_span(*pieces[piece].span);
-                    combined_clicks.insert(combined_clicks.end(), span.begin(), span.end());
-                }
-                person_clicks = std::span(combined_clicks);
-            }
         }
         std::sort(person_clicks.begin(), person_clicks.end(), [&](const auto& a, const auto& b) {
             if (a.ts != b.ts) return a.ts < b.ts;
             return keys.less(b.id, a.id);
         });
         attribution.reset();
-        UserDay daily{.person = range.person};
+        UserDay daily{.person = key};
         auto emit_day = [&] {
             int64_t largest = 0;
             for (auto category : purchased_categories) {
@@ -924,7 +853,7 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
             const auto day = utc_day(start + session_start);
             if (day != daily.day) {
                 if (daily.sessions) emit_day();
-                daily = UserDay{.person = range.person, .day = day};
+                daily = UserDay{.person = key, .day = day};
             }
             ++daily.sessions;
         };
@@ -965,10 +894,10 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
                 uint32_t previous;
                 int64_t revenue = 0;
                 do {
-                    const auto& row = person_events[event++];
-                    previous = row.ts;
+                    const auto& entry = person_events[event++];
+                    previous = entry.ts;
                     ++daily.events;
-                    if (row.purchase) revenue += add_purchase(row.purchase);
+                    if (entry.purchase) revenue += add_purchase(entry.purchase);
                 } while (event < person_events.size() && person_events[event].ts - previous <= session_gap);
                 finish_session(session_start, revenue);
             }
@@ -1011,47 +940,76 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     if (dims.categories.size() > 256) return 10;
     PersonAliases people;
     mark("dimensions");
-    // Event-ID buckets keep all revisions together, even if their user IDs differ.
-    EventPayloads payloads(workers);
-    Arena arena, payload_arena, click_arena;
+    Arena arena, person_arena, click_arena;
     std::vector<RawClickRows> clicks(workers);
+    std::vector<PersonEventRows> person_events(workers);
     {
         ChunkedInput event_input, click_input;
         event_input.folder(input / "events", read_chunk);
         click_input.folder(input / "clicks", read_chunk);
+        // Event-ID buckets keep all copies of an event together, even if their user IDs differ.
         std::vector<EventBuckets> events(workers);
         std::atomic<size_t> next_click{0};
+        const auto estimated_events = event_input.estimate_rows(27);
         if (const auto slot = click_slot(click_input, workers); slot >= 64) {
             click_arena.reserve(workers * person_bucket_count * slot * sizeof(RawClick));
         }
         if (workers == 1) {
             people = link_people(keys, input);
-            read_events(event_input, 1, start, end, keys, dims, events, payloads, arena, payload_arena);
-            read_clicks(click_input, 1, start, end, keys, dims, clicks, click_arena, next_click, 0);
+            read_events(event_input, 1, start, end, keys, dims, events, arena);
+            read_clicks(click_input, 1, start, end, keys, dims, people, clicks, click_arena, next_click, 0);
         } else {
+            // Clicks are routed by person, so the main workers wait for the
+            // linked IDs before they parse their share of the clicks.
             std::exception_ptr link_or_click_error;
+            std::atomic<bool> linked{false};
             std::jthread resolve([&] {
                 try {
                     people = link_people(keys, input);
-                    read_clicks(click_input, 1, start, end, keys, dims, clicks, click_arena, next_click, 0);
+                    linked = true;
+                    linked.notify_all();
+                    read_clicks(click_input, 1, start, end, keys, dims, people, clicks, click_arena, next_click, 0);
                 } catch (...) {
                     link_or_click_error = std::current_exception();
+                    linked = true;
+                    linked.notify_all();
                 }
             });
-            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena, payload_arena);
-            read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, click_arena, next_click, 1);
+            read_events(event_input, workers - 1, start, end, keys, dims, events, arena);
+            linked.wait(false);
+            if (!link_or_click_error) {
+                read_clicks(click_input, workers - 1, start, end, keys, dims, people, clicks, click_arena, next_click, 1);
+            }
             resolve.join();
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
         mark("parse and link");
-        deduplicate(events, workers, payloads);
-        arena.reset();
-        mark("event dedup");
+        // Person buckets hold the surviving events, about one per parsed row.
+        const auto person_slot = (estimated_events / workers / person_bucket_count * 9 / 8 + 1) & ~size_t{1};
+        if (person_slot >= 64) {
+            person_arena.reserve(workers * person_bucket_count * person_slot * sizeof(PersonEvent));
+            parallel(workers, workers, [&](size_t, size_t worker) {
+                for (auto& bucket : person_events[worker]) {
+#ifdef __AVX2__
+                    if (auto* memory = person_arena.allocate(person_slot * sizeof(PersonEvent))) {
+                        bucket.attach(static_cast<PersonEvent*>(memory), person_slot);
+                        continue;
+                    }
+#endif
+                    bucket.reserve(person_slot);
+                }
+            });
+        }
+        deduplicate(events, workers, people, person_events);
+#ifdef __AVX2__
+        // Each worker's buckets were filled by whichever tasks it ran.
+        parallel(workers, workers, [&](size_t, size_t worker) {
+            for (auto& bucket : person_events[worker]) bucket.flush_tail();
+            _mm_sfence();
+        });
+#endif
+        mark("event dedup and person routing");
     }
-    TimelineStorage storage;
-    SpanPartitions spans(workers);
-    group_raw_payloads(payloads, clicks, workers, people, storage, spans, arena);
-    mark("group raw users");
     auto first_day = utc_day(start);
     auto day_count = utc_day(end - 1) - first_day + 1;
     size_t campaign_slots = day_count * dims.campaign_values.size();
@@ -1062,27 +1020,27 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     std::atomic<size_t> next_bucket{0};
     parallel(workers, workers, [&](size_t, size_t worker) {
         parquet::File writer(user_output / ("part-" + std::to_string(worker) + ".parquet"), parquet::user_schema);
+        SummaryScratch scratch;
         for (size_t bucket; (bucket = next_bucket.fetch_add(1, std::memory_order_relaxed)) < person_bucket_count;) {
-            summarize_bucket(storage, spans, bucket, keys, dims, start, first_day,
-                             attribution[worker], writer, campaigns[worker]);
+            summarize_bucket(person_events, clicks, bucket, keys, dims, start, first_day,
+                             attribution[worker], writer, campaigns[worker], scratch);
         }
         writer.finish();
     });
-    mark("sessionize, attribute and write user Parquet");
+    mark("group, sessionize, attribute and write user Parquet");
     for (size_t worker = 1; worker < workers; ++worker) {
         for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot] += campaigns[worker][slot];
     }
     write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
     mark("campaign Parquet");
     // Process exit frees the remaining pages on one thread. Release the
-    // large timelines in parallel first.
-    parallel(workers, person_bucket_count, [&](size_t, size_t bucket) {
-        discard_memory(storage.fallback[bucket].get(), storage.fallback_bytes[bucket]);
-        if (bucket < workers) {
-            arena.discard(bucket, workers);
-            payload_arena.discard(bucket, workers);
-            click_arena.discard(bucket, workers);
-        }
+    // large buffers in parallel first.
+    parallel(workers, workers, [&](size_t, size_t worker) {
+        arena.discard(worker, workers);
+        person_arena.discard(worker, workers);
+        click_arena.discard(worker, workers);
+        for (auto& bucket : person_events[worker]) release_event_buffer(bucket);
+        for (auto& bucket : clicks[worker]) release_event_buffer(bucket);
     });
     mark("release memory");
     if (profile) {
