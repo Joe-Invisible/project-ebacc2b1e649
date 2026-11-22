@@ -131,6 +131,8 @@ public:
     size_t size() const { return used; }
     const T* begin() const { return rows; }
     const T* end() const { return used ? rows + used : rows; }
+    T* begin() { return rows; }
+    T* end() { return used ? rows + used : rows; }
     T& operator[](size_t index) { return rows[index]; }
 
     void reserve(size_t minimum) {
@@ -724,9 +726,8 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clic
             uint32_t event_cursor = 0, click_cursor = 0;
         };
         std::vector<RawUser> ranges;
-        std::vector<uint32_t> event_groups, click_groups;
-        event_groups.reserve(event_count);
-        click_groups.reserve(click_count);
+        // A row's user hash is not needed once it is grouped, so the first
+        // pass stores the group number in its place for the scatter pass.
         auto get_group = [&](uint64_t hash) {
             auto next = static_cast<uint32_t>(ranges.size());
             people.reserve(next + 1);
@@ -734,19 +735,19 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clic
             if (group == next) ranges.push_back(RawUser{.hash = hash});
             return group;
         };
-        for (const auto& feed : payloads.rows) {
-            for (const auto& event : feed[bucket]) {
+        for (auto& feed : payloads.rows) {
+            for (auto& event : feed[bucket]) {
                 if (event.ts == invalid_event) continue;
                 auto group = get_group(event.user_hash);
                 ++ranges[group].events;
-                event_groups.push_back(group);
+                event.user_hash = group;
             }
         }
-        for (const auto& feed : clicks) {
-            for (const auto& click : feed[bucket]) {
+        for (auto& feed : clicks) {
+            for (auto& click : feed[bucket]) {
                 auto group = get_group(click.user_hash);
                 ++ranges[group].clicks;
-                click_groups.push_back(group);
+                click.user_hash = group;
             }
         }
         // Route each raw ID once, including IDs with clicks but no events.
@@ -778,14 +779,14 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clic
         for (auto& feed : payloads.rows) {
             for (const auto& event : feed[bucket]) {
                 if (event.ts == invalid_event) continue;
-                event_timeline[ranges[event_groups[row++]].event_cursor++] = {event.ts, event.purchase};
+                event_timeline[ranges[static_cast<uint32_t>(event.user_hash)].event_cursor++] = {event.ts, event.purchase};
             }
             release_event_buffer(feed[bucket]);
         }
         row = 0;
         for (auto& feed : clicks) {
             for (const auto& click : feed[bucket]) {
-                click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id_a, click.id_b, click.ts, click.campaign};
+                click_timeline[ranges[static_cast<uint32_t>(click.user_hash)].click_cursor++] = {click.id_a, click.id_b, click.ts, click.campaign};
             }
             release_event_buffer(feed[bucket]);
         }
