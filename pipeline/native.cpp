@@ -430,7 +430,7 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                  Arena& arena, Arena& payload_arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
     const auto rows_per_worker = mapped.estimate_rows(27) / workers;
-    const auto reserved = rows_per_worker + rows_per_worker / 8;
+    const auto reserved = rows_per_worker + rows_per_worker / 16;
     const auto readers = std::min(workers, mapped.chunks.size());
     const bool reserve = reserved >= 256 * person_bucket_count;
     const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
@@ -597,7 +597,7 @@ void deduplicate(std::vector<EventBuckets>& events, std::vector<LongEventBuckets
 // Rows reserved for each worker's click bucket.
 size_t click_slot(const ChunkedInput& mapped, size_t workers) {
     const auto per_bucket = mapped.estimate_rows(27) / workers / person_bucket_count;
-    return (per_bucket + per_bucket / 4 + 1) & ~size_t{1};
+    return (per_bucket + per_bucket / 8 + 1) & ~size_t{1};
 }
 
 void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end, Keys& keys,
@@ -1040,9 +1040,10 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         }
         last = now;
     };
-    // Long IDs are interned in a table sized from the input. About one row
-    // in eight brings a new long ID, so a slot per four rows (rounded up to a
-    // power of two) keeps the table under half full.
+    // Long user and click IDs, and long event IDs not in the generator's
+    // shape, are interned in a table sized from the input: one slot per
+    // sixteen rows, rounded up to a power of two. Generator data fills about
+    // a fifth of it.
     size_t input_bytes = 0;
     for (const char* folder : {"events", "clicks", "links"}) {
         if (!fs::exists(input / folder)) continue;
@@ -1050,7 +1051,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             if (entry.is_regular_file()) input_bytes += entry.file_size();
         }
     }
-    Keys keys(input_bytes / 40 / 4 / 2);
+    Keys keys(input_bytes / 40 / 16);
     const auto dims = dimensions(keys, input);
     if (dims.categories.size() > 256) return 10;
     PersonAliases people;
