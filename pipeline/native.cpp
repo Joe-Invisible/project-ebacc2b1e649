@@ -77,7 +77,9 @@ class EventBuffer {
     T* rows = nullptr;
     size_t used = 0, capacity = 0;
     bool owned = true;
+#ifndef SHOPPING_PLAIN_STORES
     alignas(64) T line[rows_per_line];
+#endif
 
 public:
     EventBuffer() = default;
@@ -109,7 +111,11 @@ public:
         if (rows) {
             // Growth reads the completed lines from the old allocation.
             _mm_sfence();
+#ifdef SHOPPING_PLAIN_STORES
+            std::memcpy(allocation, rows, used * sizeof(T));
+#else
             std::memcpy(allocation, rows, (used & ~(rows_per_line - 1)) * sizeof(T));
+#endif
             if (owned) std::free(rows);
         }
         rows = allocation;
@@ -118,6 +124,11 @@ public:
     }
 
     void push_back(const T& value) {
+#ifdef SHOPPING_PLAIN_STORES
+        if (used == capacity) reserve(std::max(rows_per_line, capacity * 2));
+        rows[used++] = value;
+        return;
+#endif
         const auto slot = used % rows_per_line;
         line[slot] = value;
         if (slot + 1 == rows_per_line) {
@@ -131,6 +142,9 @@ public:
     }
 
     void flush_tail() {
+#ifdef SHOPPING_PLAIN_STORES
+        return;
+#endif
         if (used > capacity) reserve(used);
         const auto tail = used % rows_per_line;
         if (tail) std::memcpy(rows + used - tail, line, tail * sizeof(T));
