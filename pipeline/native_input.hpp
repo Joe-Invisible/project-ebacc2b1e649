@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <filesystem>
 #include <mutex>
@@ -17,8 +16,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <vector>
+#include <type_traits>
+#include <unordered_map>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -50,12 +50,23 @@ inline Key unhash_key(uint64_t hash) {
     return hash ^ (hash >> 33);
 }
 
-// Short ASCII keys preserve byte order. Other strings are interned exactly.
+// Thrown when input exceeds a fixed native layout; the caller then uses the
+// reference pipeline instead.
+struct InputLayoutLimit {};
+
+// Short ASCII keys preserve byte order. Other strings are interned exactly in
+// a lock-free table that every parsing thread reads and inserts into at once;
+// the slot number becomes the key, and each string is stored once.
 class Keys {
     static constexpr Key external = Key{1} << 63;
-    mutable std::mutex mutex;
-    std::deque<std::string> strings;
-    std::unordered_map<std::string_view, Key> indexes;
+    static constexpr uint64_t busy = ~uint64_t{0};
+    struct Slot {
+        std::atomic<uint64_t> tag{0};
+        const char* text = nullptr; // Length-prefixed bytes in a storage chunk.
+    };
+    Slot* slots = nullptr;
+    size_t mask = 0;
+    std::atomic<size_t> used{0};
 
     static Key short_key(std::string_view value) {
         if (value.empty() || value.size() > 9) return 0;
@@ -81,20 +92,104 @@ class Keys {
 #endif
     }
 
+    static uint64_t hash_text(std::string_view value) {
+        uint64_t hash = 0x9e3779b97f4a7c15ULL ^ value.size();
+        size_t i = 0;
+        for (; i + 8 <= value.size(); i += 8) {
+            uint64_t word;
+            std::memcpy(&word, value.data() + i, 8);
+            hash = (hash ^ word) * 0xbf58476d1ce4e5b9ULL;
+            hash ^= hash >> 31;
+        }
+        if (i < value.size()) {
+            uint64_t word = 0;
+            std::memcpy(&word, value.data() + i, value.size() - i);
+            hash = (hash ^ word) * 0xbf58476d1ce4e5b9ULL;
+            hash ^= hash >> 31;
+        }
+        hash ^= hash >> 29;
+        hash *= 0x94d049bb133111ebULL;
+        return hash ^ (hash >> 32);
+    }
+
+    // Copies a string into this thread's storage. Chunks live until exit.
+    static const char* store(std::string_view value) {
+        struct Chunk {
+            char* next = nullptr;
+            char* end = nullptr;
+        };
+        thread_local Chunk chunk;
+        const size_t bytes = (sizeof(uint32_t) + value.size() + 7) & ~size_t{7};
+        if (static_cast<size_t>(chunk.end - chunk.next) < bytes) {
+            const size_t size = std::max<size_t>(bytes, 1 << 20);
+            chunk.next = static_cast<char*>(std::malloc(size));
+            if (!chunk.next) throw std::bad_alloc{};
+            chunk.end = chunk.next + size;
+        }
+        char* text = chunk.next;
+        chunk.next += bytes;
+        const auto length = static_cast<uint32_t>(value.size());
+        std::memcpy(text, &length, sizeof length);
+        std::memcpy(text + sizeof length, value.data(), value.size());
+        return text;
+    }
+
+    static std::string_view text_of(const char* text) {
+        uint32_t length;
+        std::memcpy(&length, text, sizeof length);
+        return {text + sizeof length, length};
+    }
+
 public:
+    // Anonymous pages read as zero, which is an empty slot, so the table
+    // needs no initialization pass. It lives until the process exits.
+    explicit Keys(size_t capacity = 1 << 16) {
+        static_assert(std::is_trivially_destructible_v<Slot>);
+        const size_t size = std::bit_ceil(std::max<size_t>(capacity, 1024));
+        auto memory = mmap(nullptr, size * sizeof(Slot), PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (memory == MAP_FAILED) throw std::bad_alloc{};
+        const char* huge = std::getenv("SHOPPING_HUGEPAGES");
+        if (!huge || std::string_view(huge) != "0") madvise(memory, size * sizeof(Slot), MADV_HUGEPAGE);
+        slots = static_cast<Slot*>(memory);
+        mask = size - 1;
+    }
+    Keys(const Keys&) = delete;
+
     Key encode(std::string_view value) {
         if (value.empty()) return 0;
         if (auto key = short_key(value)) return key;
-        std::lock_guard lock(mutex);
-        if (auto existing = indexes.find(value); existing != indexes.end()) return existing->second;
-        Key key = external | strings.size();
-        strings.emplace_back(value);
-        indexes.emplace(strings.back(), key);
-        return key;
+        if (value.size() > UINT32_MAX) throw std::length_error("ID too long");
+        auto tag = hash_text(value);
+        if (tag == 0 || tag == busy) tag = 1;
+        for (size_t slot = tag & mask;; slot = (slot + 1) & mask) {
+            auto& entry = slots[slot];
+            auto current = entry.tag.load(std::memory_order_acquire);
+            if (current == 0) {
+                // Keep the table at most half full so probes stay short.
+                if (used.fetch_add(1, std::memory_order_relaxed) >= (mask + 1) / 2) {
+                    throw InputLayoutLimit{};
+                }
+                if (entry.tag.compare_exchange_strong(current, busy, std::memory_order_acquire)) {
+                    entry.text = store(value);
+                    entry.tag.store(tag, std::memory_order_release);
+                    return external | slot;
+                }
+                used.fetch_sub(1, std::memory_order_relaxed);
+            }
+            // Another thread is storing this slot's string. Wait for it.
+            while (current == busy) {
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
+                current = entry.tag.load(std::memory_order_acquire);
+            }
+            if (current == tag && text_of(entry.text) == value) return external | slot;
+        }
     }
 
     std::string_view decode(Key key, std::array<char, 9>& buffer) const {
-        if (key & external) return strings[key & ~external];
+        if (key & external) return text_of(slots[key & ~external].text);
         size_t size = 0;
         for (int shift = 56; shift >= 0; shift -= 7) {
             auto byte = static_cast<char>((key >> shift) & 127);
@@ -106,11 +201,9 @@ public:
 
     bool less(Key a, Key b) const {
         if (!((a | b) & external)) return a < b;
-        std::lock_guard lock(mutex);
         std::array<char, 9> x, y;
         return decode(a, x).compare(decode(b, y)) < 0;
     }
-
 };
 
 #ifdef __AVX2__

@@ -22,11 +22,13 @@ for dataset in "$@"; do
     runs="$runs SHOPPING_PGO_TRAINING=1 DATA_DIR=/train/$index OUTPUT_DIR=/tmp/out-$index NCPU=8 /tmp/train;"
     index=$((index + 1))
 done
-rm -rf "$here/pipeline/pgo"
-mkdir -p "$here/pipeline/pgo"
+# Train into a temporary folder; the committed profile is only replaced
+# once training succeeds.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 # shellcheck disable=SC2086
 docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
-    -v "$here/pipeline:/pipeline:ro" -v "$here/pipeline/pgo:/pgo" $mounts \
+    -v "$here/pipeline:/pipeline:ro" -v "$work:/pgo" $mounts \
     "$image" sh -euc "
         mkdir -p /tmp/src && cp /pipeline/*.cpp /pipeline/*.hpp /tmp/src/
         cd /tmp/src
@@ -37,4 +39,8 @@ docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
         $runs
         cp /tmp/src/*.gcda /pgo/
     "
+ls "$work"/*.gcda >/dev/null
+rm -rf "$here/pipeline/pgo"
+mkdir -p "$here/pipeline/pgo"
+cp "$work"/*.gcda "$here/pipeline/pgo/"
 ls -l "$here/pipeline/pgo"
