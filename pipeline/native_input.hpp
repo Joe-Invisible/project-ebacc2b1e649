@@ -223,6 +223,16 @@ public:
     }
     Keys(const Keys&) = delete;
 
+    // Rebuilds an ID packed by pack_long_id from its first byte and digits.
+    static std::string_view unpack_long_id(unsigned char first, uint64_t high, uint64_t low,
+                                           std::array<char, 40>& buffer) {
+        Slot slot;
+        slot.head = hex_form | first;
+        slot.high = high;
+        slot.low = low;
+        return unpack_hex(slot, buffer);
+    }
+
     // For an ID of one byte plus 32 lowercase hex digits, gives its exact
     // packed form without using the table: a hash in the high 56 bits of id
     // with the first byte in the low 8, and the digits in high and low.

@@ -59,13 +59,45 @@ struct RawEvent {
     uint32_t ts;
     uint32_t purchase; // Low 24 bits are price in cents, high 8 bits are category.
 };
+// A click ID either as a key (id_low = 0 marker in id_first) or, for the
+// generator's long shape, packed exactly: first byte plus 32 hex digits.
+// Packed IDs never go through the shared intern table.
+struct ClickId {
+    uint64_t a = 0, b = 0;   // Key, or the high and low hex digits.
+    unsigned char first = 0; // 0 for a key, else the packed ID's first byte.
+
+    static ClickId of(Keys& keys, std::string_view value) {
+        uint64_t id, high, low;
+        if (!value.empty() && value[0] != 0 && Keys::pack_long_id(value, id, high, low)) {
+            return {high, low, static_cast<unsigned char>(value[0])};
+        }
+        return {keys.encode(value), 0, 0};
+    }
+    std::string_view text(const Keys& keys, Keys::Buffer& buffer) const {
+        return first ? Keys::unpack_long_id(first, a, b, buffer) : keys.decode(a, buffer);
+    }
+    // Byte-wise order of the IDs. Two packed IDs have the same length and
+    // lowercase hex digits, whose byte order matches their numeric order.
+    static bool less(const ClickId& x, const ClickId& y, const Keys& keys) {
+        if (x.first && y.first) {
+            if (x.first != y.first) return x.first < y.first;
+            return x.a != y.a ? x.a < y.a : x.b < y.b;
+        }
+        if (!x.first && !y.first) return keys.less(x.a, y.a);
+        Keys::Buffer p, q;
+        return x.text(keys, p) < y.text(keys, q);
+    }
+};
+
+constexpr uint32_t campaign_mask = (uint32_t{1} << 24) - 1;
 struct RawClick {
     uint64_t user_hash;
-    Key id;
+    uint64_t id_a;
     uint32_t ts; // Offset from the beginning of the click window.
-    uint32_t campaign;
-    uint64_t padding; // Two rows fill a cache line for streaming stores.
+    uint32_t campaign; // Low 24 bits; the high 8 bits are ClickId::first.
+    uint64_t id_b;
 };
+static_assert(sizeof(RawClick) == 32);
 
 #ifdef __AVX2__
 // Buffer a full cache line before writing to the long-lived event arrays.
@@ -635,7 +667,9 @@ void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                 const auto hash = hash_key(keys.encode(fields[1]));
                 const auto bucket = bucket_from_hash<person_bucket_count>(hash);
                 const auto offset = static_cast<uint32_t>(*ts - (start - week_ms));
-                output[worker][bucket].push_back({hash, keys.encode(fields[0]), offset, campaign, 0});
+                const auto click_id = ClickId::of(keys, fields[0]);
+                output[worker][bucket].push_back({hash, click_id.a, offset,
+                                                  campaign | (uint32_t{click_id.first} << 24), click_id.b});
             });
         }
 #ifdef __AVX2__
@@ -648,8 +682,10 @@ struct TimelineEvent {
     uint32_t ts, purchase;
 };
 struct TimelineClick {
-    Key id;
-    uint32_t ts, campaign;
+    uint64_t id_a, id_b;
+    uint32_t ts;
+    uint32_t campaign; // Low 24 bits; the high 8 bits are ClickId::first.
+    ClickId id() const { return {id_a, id_b, static_cast<unsigned char>(campaign >> 24)}; }
 };
 struct PersonRange {
     Key person;
@@ -749,7 +785,7 @@ void group_raw_payloads(EventPayloads& payloads, std::vector<RawClickRows>& clic
         row = 0;
         for (auto& feed : clicks) {
             for (const auto& click : feed[bucket]) {
-                click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id, click.ts, click.campaign};
+                click_timeline[ranges[click_groups[row++]].click_cursor++] = {click.id_a, click.id_b, click.ts, click.campaign};
             }
             release_event_buffer(feed[bucket]);
         }
@@ -777,14 +813,14 @@ public:
     void credit(std::span<const TimelineClick> clicks, int64_t ts, size_t base,
                 int64_t revenue, std::vector<CampaignMetrics>& daily) {
         while (right < clicks.size() && clicks[right].ts <= ts) {
-            auto campaign = clicks[right++].campaign;
+            auto campaign = clicks[right++].campaign & campaign_mask;
             if (!counts[campaign]++) {
                 position[campaign] = active.size();
                 active.push_back(campaign);
             }
         }
         while (left < right && clicks[left].ts < ts - week_ms) {
-            auto campaign = clicks[left++].campaign;
+            auto campaign = clicks[left++].campaign & campaign_mask;
             if (!--counts[campaign]) {
                 auto last = active.back();
                 active[position[campaign]] = last;
@@ -792,7 +828,7 @@ public:
                 active.pop_back();
             }
         }
-        auto campaign = left < right ? clicks[right - 1].campaign : counts.size() - 1;
+        auto campaign = left < right ? clicks[right - 1].campaign & campaign_mask : counts.size() - 1;
         auto& credited = daily[base + campaign];
         ++credited.sessions;
         credited.purchasing += revenue > 0;
@@ -947,7 +983,7 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
         }
         std::sort(person_clicks.begin(), person_clicks.end(), [&](const auto& a, const auto& b) {
             if (a.ts != b.ts) return a.ts < b.ts;
-            return keys.less(b.id, a.id);
+            return ClickId::less(b.id(), a.id(), keys);
         });
         attribution.reset();
         UserDay daily{.person = range.person};
@@ -1054,6 +1090,8 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     Keys keys(input_bytes / 40 / 16);
     const auto dims = dimensions(keys, input);
     if (dims.categories.size() > 256) return 10;
+    // Campaign numbers share a 32-bit field with a click ID byte.
+    if (dims.campaign_values.size() > campaign_mask) return 10;
     PersonAliases people;
     mark("dimensions");
     // Event-ID buckets keep all revisions together, even if their user IDs differ.
