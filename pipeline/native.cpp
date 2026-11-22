@@ -761,7 +761,12 @@ class Attribution {
     size_t left = 0, right = 0;
 
 public:
-    explicit Attribution(size_t campaigns) : counts(campaigns), position(campaigns) {
+    // Assisted sessions per (day, campaign) slot. They are counted apart from
+    // the other metrics: the dense array stays in L2, and every session adds
+    // to it once per active campaign.
+    std::vector<uint32_t> assisted;
+
+    Attribution(size_t campaigns, size_t slots) : counts(campaigns), position(campaigns), assisted(slots) {
         active.reserve(campaigns);
     }
     void reset() {
@@ -792,7 +797,7 @@ public:
         ++credited.sessions;
         credited.purchasing += revenue > 0;
         credited.revenue += revenue;
-        for (auto assisted : active) ++daily[base + assisted].assisted;
+        for (auto campaign : active) ++assisted[base + campaign];
     }
 };
 
@@ -1098,7 +1103,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     const auto user_output = output / "user_daily";
     fs::create_directories(user_output);
     std::vector<std::vector<CampaignMetrics>> campaigns(workers, std::vector<CampaignMetrics>(campaign_slots));
-    std::vector<Attribution> attribution(workers, Attribution(dims.campaign_values.size()));
+    std::vector<Attribution> attribution(workers, Attribution(dims.campaign_values.size(), campaign_slots));
     std::atomic<size_t> next_bucket{0};
     parallel(workers, workers, [&](size_t, size_t worker) {
         parquet::File writer(user_output / ("part-" + std::to_string(worker) + ".parquet"), parquet::user_schema);
@@ -1111,6 +1116,9 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     mark("sessionize, attribute and write user Parquet");
     for (size_t worker = 1; worker < workers; ++worker) {
         for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot] += campaigns[worker][slot];
+    }
+    for (size_t worker = 0; worker < workers; ++worker) {
+        for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot].assisted += attribution[worker].assisted[slot];
     }
     write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
     mark("campaign Parquet");
