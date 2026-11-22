@@ -223,6 +223,18 @@ public:
     }
     Keys(const Keys&) = delete;
 
+    // For an ID of one byte plus 32 lowercase hex digits, gives its exact
+    // packed form without using the table: a hash in the high 56 bits of id
+    // with the first byte in the low 8, and the digits in high and low.
+    static bool pack_long_id(std::string_view value, uint64_t& id, uint64_t& high, uint64_t& low) {
+        Packed packed{};
+        if (!pack_hex(value, packed)) return false;
+        id = (hash_packed(packed) & ~uint64_t{0xff}) | (packed.head & 0xff);
+        high = packed.high;
+        low = packed.low;
+        return true;
+    }
+
     Key encode(std::string_view value) {
         if (value.empty()) return 0;
         if (auto key = short_key(value)) return key;

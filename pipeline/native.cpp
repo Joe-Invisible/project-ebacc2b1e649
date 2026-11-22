@@ -39,6 +39,19 @@ struct EventVersion {
     uint32_t position;
 };
 static_assert(sizeof(EventVersion) == 16);
+// A version whose event ID has the generator's long shape. The ID travels
+// packed, so deduplication compares it exactly without the shared intern
+// table. Such an ID never equals one in an EventVersion.
+struct LongEventVersion {
+    uint64_t id; // Hash in the high 56 bits, the ID's first byte in the low 8.
+    uint64_t high, low; // The 32 hex digits.
+    uint32_t ingest;
+    uint32_t position;
+    bool same_id(const LongEventVersion& other) const {
+        return id == other.id && high == other.high && low == other.low;
+    }
+};
+static_assert(sizeof(LongEventVersion) == 32);
 constexpr uint32_t missing_payload = UINT32_MAX;
 struct WideEventLayout {};
 struct RawEvent {
@@ -192,6 +205,7 @@ public:
 template<class T>
 using PersonBuckets = std::array<std::vector<T>, person_bucket_count>;
 using EventBuckets = std::array<EventBuffer<EventVersion>, event_bucket_count>;
+using LongEventBuckets = std::array<EventBuffer<LongEventVersion>, event_bucket_count>;
 using RawEventRows = std::array<EventBuffer<RawEvent>, person_bucket_count>;
 using RawClickRows = std::array<EventBuffer<RawClick>, person_bucket_count>;
 
@@ -398,7 +412,8 @@ size_t estimate_event_count(const MappedInput& mapped) {
 }
 
 void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int64_t end,
-                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output, EventPayloads& payloads,
+                 Keys& keys, const Dimensions& dims, std::vector<EventBuckets>& output,
+                 std::vector<LongEventBuckets>& long_output, EventPayloads& payloads,
                  Arena& arena, Arena& payload_arena) {
     const auto origin = start / 1000 - (int64_t{1} << 31);
     const auto rows_per_worker = mapped.estimate_rows(27) / workers;
@@ -407,8 +422,11 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
     const bool reserve = reserved >= 256 * person_bucket_count;
     const auto version_slot = (reserved / event_bucket_count + 3) & ~size_t{3};
     const auto payload_slot = (reserved / person_bucket_count + 3) & ~size_t{3};
+    // About one event in eight has a long ID; a buffer that fills up grows.
+    const auto long_slot = (version_slot / 4 + 1) & ~size_t{1};
     if (reserve) {
-        arena.reserve(readers * event_bucket_count * version_slot * sizeof(EventVersion));
+        arena.reserve(readers * event_bucket_count * (version_slot * sizeof(EventVersion) +
+                                                      long_slot * sizeof(LongEventVersion)));
         payload_arena.reserve(readers * person_bucket_count * payload_slot * sizeof(RawEvent));
     }
     std::atomic<size_t> next_part{0};
@@ -431,6 +449,15 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
 #endif
                     bucket.reserve(version_slot);
                 }
+                for (auto& bucket : long_output[worker]) {
+#ifdef __AVX2__
+                    if (auto* memory = arena.allocate(long_slot * sizeof(LongEventVersion))) {
+                        bucket.attach(static_cast<LongEventVersion*>(memory), long_slot);
+                        continue;
+                    }
+#endif
+                    bucket.reserve(long_slot);
+                }
                 for (auto& bucket : payloads.rows[worker]) {
 #ifdef __AVX2__
                     if (auto* memory = payload_arena.allocate(payload_slot * sizeof(RawEvent))) {
@@ -444,7 +471,9 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
             std::vector<char> buffer;
             for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
                 read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
-                    const auto id_hash = hash_key(keys.encode(fields[0]));
+                    uint64_t long_id, high, low;
+                    const bool long_shape = Keys::pack_long_id(fields[0], long_id, high, low);
+                    const auto id_hash = long_shape ? 0 : hash_key(keys.encode(fields[0]));
                     if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
                     const auto ingest = ingest_seconds(fields[3]);
                     const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
@@ -465,11 +494,17 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                             version.position = payloads.store(worker, {hash_key(keys.encode(fields[1])), offset, 0});
                         }
                     }
-                    output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
+                    if (long_shape) {
+                        long_output[worker][bucket_from_hash<event_bucket_count>(long_id)].push_back(
+                            {long_id, high, low, version.ingest, version.position});
+                    } else {
+                        output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
+                    }
                 });
             }
 #ifdef __AVX2__
             for (auto& bucket : output[worker]) bucket.flush_tail();
+            for (auto& bucket : long_output[worker]) bucket.flush_tail();
             for (auto& bucket : payloads.rows[worker]) bucket.flush_tail();
 #endif
         } catch (...) {
@@ -479,54 +514,69 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
     });
 }
 
-void deduplicate(std::vector<EventBuckets>& events, size_t workers, EventPayloads& payloads) {
-    parallel(workers, event_bucket_count, [&](size_t, size_t bucket) {
-        size_t count = 0;
-        for (const auto& feed : events) count += feed[bucket].size();
-        if (!count) return;
-        const size_t homes = std::bit_ceil(std::max<size_t>(64, count * 8));
-        std::vector<uint64_t> seen(homes / 64), repeated(homes / 64);
-        size_t collisions = 0;
-        for (const auto& feed : events) {
-            for (const auto& version : feed[bucket]) {
-                const auto home = version.id_hash & (homes - 1);
-                const auto bit = uint64_t{1} << (home % 64);
-                auto& word = seen[home / 64];
-                if (word & bit) {
-                    repeated[home / 64] |= bit;
-                    ++collisions;
-                }
-                word |= bit;
+// Keeps, for each event ID in one bucket, the copy with the smallest ingest
+// time and drops the payloads of the others. home_bits gives well-mixed bits
+// of a version's ID hash; same compares two versions' IDs exactly.
+template<class Version, class HomeBits, class Same>
+void deduplicate_bucket(std::vector<std::array<EventBuffer<Version>, event_bucket_count>>& feeds, size_t bucket,
+                        EventPayloads& payloads, HomeBits home_bits, Same same) {
+    size_t count = 0;
+    for (const auto& feed : feeds) count += feed[bucket].size();
+    if (!count) return;
+    const size_t homes = std::bit_ceil(std::max<size_t>(64, count * 8));
+    std::vector<uint64_t> seen(homes / 64), repeated(homes / 64);
+    size_t collisions = 0;
+    for (const auto& feed : feeds) {
+        for (const auto& version : feed[bucket]) {
+            const auto home = home_bits(version) & (homes - 1);
+            const auto bit = uint64_t{1} << (home % 64);
+            auto& word = seen[home / 64];
+            if (word & bit) {
+                repeated[home / 64] |= bit;
+                ++collisions;
             }
+            word |= bit;
         }
-        const size_t capacity = std::bit_ceil(std::max<size_t>(2, collisions * 4));
-        std::vector<uint32_t> index(capacity, invalid_event);
-        std::vector<const EventVersion*> winners;
-        winners.reserve(collisions * 2);
-        for (const auto& feed : events) {
-            for (const auto& version : feed[bucket]) {
-                const auto hash = version.id_hash;
-                const auto home = hash & (homes - 1);
-                if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) continue;
-                auto slot = hash & (capacity - 1);
-                while (index[slot] != invalid_event && winners[index[slot]]->id_hash != version.id_hash) {
-                    slot = (slot + 1) & (capacity - 1);
-                }
-                if (index[slot] == invalid_event) {
-                    index[slot] = winners.size();
-                    winners.push_back(&version);
+    }
+    const size_t capacity = std::bit_ceil(std::max<size_t>(2, collisions * 4));
+    std::vector<uint32_t> index(capacity, invalid_event);
+    std::vector<const Version*> winners;
+    winners.reserve(collisions * 2);
+    for (const auto& feed : feeds) {
+        for (const auto& version : feed[bucket]) {
+            const auto hash = home_bits(version);
+            const auto home = hash & (homes - 1);
+            if (!(repeated[home / 64] & (uint64_t{1} << (home % 64)))) continue;
+            auto slot = hash & (capacity - 1);
+            while (index[slot] != invalid_event && !same(*winners[index[slot]], version)) {
+                slot = (slot + 1) & (capacity - 1);
+            }
+            if (index[slot] == invalid_event) {
+                index[slot] = winners.size();
+                winners.push_back(&version);
+            } else {
+                auto& current = winners[index[slot]];
+                if (version.ingest < current->ingest) {
+                    payloads.discard(current->position);
+                    current = &version;
                 } else {
-                    auto& current = winners[index[slot]];
-                    if (version.ingest < current->ingest) {
-                        payloads.discard(current->position);
-                        current = &version;
-                    } else {
-                        payloads.discard(version.position);
-                    }
+                    payloads.discard(version.position);
                 }
             }
         }
-        for (auto& feed : events) release_event_buffer(feed[bucket]);
+    }
+    for (auto& feed : feeds) release_event_buffer(feed[bucket]);
+}
+
+void deduplicate(std::vector<EventBuckets>& events, std::vector<LongEventBuckets>& long_events,
+                 size_t workers, EventPayloads& payloads) {
+    parallel(workers, event_bucket_count, [&](size_t, size_t bucket) {
+        deduplicate_bucket(events, bucket, payloads,
+                           [](const EventVersion& version) { return version.id_hash; },
+                           [](const EventVersion& a, const EventVersion& b) { return a.id_hash == b.id_hash; });
+        deduplicate_bucket(long_events, bucket, payloads,
+                           [](const LongEventVersion& version) { return version.id >> 8; },
+                           [](const LongEventVersion& a, const LongEventVersion& b) { return a.same_id(b); });
     });
 }
 
@@ -995,13 +1045,14 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         event_input.folder(input / "events", read_chunk);
         click_input.folder(input / "clicks", read_chunk);
         std::vector<EventBuckets> events(workers);
+        std::vector<LongEventBuckets> long_events(workers);
         std::atomic<size_t> next_click{0};
         if (const auto slot = click_slot(click_input, workers); slot >= 64) {
             click_arena.reserve(workers * person_bucket_count * slot * sizeof(RawClick));
         }
         if (workers == 1) {
             people = link_people(keys, input);
-            read_events(event_input, 1, start, end, keys, dims, events, payloads, arena, payload_arena);
+            read_events(event_input, 1, start, end, keys, dims, events, long_events, payloads, arena, payload_arena);
             read_clicks(click_input, 1, start, end, keys, dims, clicks, click_arena, next_click, 0);
         } else {
             std::exception_ptr link_or_click_error;
@@ -1013,13 +1064,13 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
                     link_or_click_error = std::current_exception();
                 }
             });
-            read_events(event_input, workers - 1, start, end, keys, dims, events, payloads, arena, payload_arena);
+            read_events(event_input, workers - 1, start, end, keys, dims, events, long_events, payloads, arena, payload_arena);
             read_clicks(click_input, workers - 1, start, end, keys, dims, clicks, click_arena, next_click, 1);
             resolve.join();
             if (link_or_click_error) std::rethrow_exception(link_or_click_error);
         }
         mark("parse and link");
-        deduplicate(events, workers, payloads);
+        deduplicate(events, long_events, workers, payloads);
         arena.reset();
         mark("event dedup");
     }
