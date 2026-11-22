@@ -22,6 +22,8 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sched.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(__BMI2__) || defined(__AVX2__)
@@ -656,6 +658,28 @@ void read_part(Part part, Function&& visit) {
 
 inline bool profile_workers = false;
 
+// SHOPPING_PIN=1 pins worker w of every parallel stage to the w-th CPU this
+// process may use, so workers stop migrating between CPUs mid-stage.
+inline void pin_worker(size_t worker) {
+    static const std::vector<int> cpus = [] {
+        std::vector<int> list;
+        const char* setting = std::getenv("SHOPPING_PIN");
+        if (!setting || std::string_view(setting) != "1") return list;
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return list;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &allowed)) list.push_back(cpu);
+        }
+        return list;
+    }();
+    if (cpus.empty()) return;
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(cpus[worker % cpus.size()], &one);
+    pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+}
+
 template <class Function>
 void parallel(size_t workers, size_t count, Function&& work) {
     const auto began = std::chrono::steady_clock::now();
@@ -665,6 +689,7 @@ void parallel(size_t workers, size_t count, Function&& work) {
     std::mutex error_mutex;
     std::exception_ptr error;
     auto run = [&](size_t worker) {
+        pin_worker(worker);
         try {
             for (size_t task; !failed && (task = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
                 work(worker, task);
