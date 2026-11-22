@@ -484,7 +484,7 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
             }
             std::vector<char> buffer;
             for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
-                read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
+                read_rows<7>(mapped.load(part, buffer), [&](const auto& fields) {
                     uint64_t long_id, high, low;
                     const bool long_shape = Keys::pack_long_id(fields[0], long_id, high, low);
                     const auto id_hash = long_shape ? 0 : hash_key(keys.encode(fields[0]));
@@ -626,7 +626,7 @@ void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int6
         }
         std::vector<char> buffer;
         for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
-            read_part<4>(mapped.load(part, buffer), [&](const auto& fields) {
+            read_rows<4>(mapped.load(part, buffer), [&](const auto& fields) {
                 if (fields[1].empty() || fields[2].empty()) return;
                 auto ts = timestamp_ms(fields[3]);
                 if (!ts || *ts < start - week_ms || *ts >= end) return;

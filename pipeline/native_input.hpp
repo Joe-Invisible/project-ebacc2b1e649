@@ -478,6 +478,9 @@ public:
 // Reads CSV files in fixed-size chunks with pread into a caller-owned buffer
 // that stays cache resident. Unlike a file mapping, this needs no page-table
 // setup for the input and nothing to tear down afterwards.
+// Bytes readable after the end of a loaded chunk.
+inline constexpr size_t scan_padding = 64;
+
 class ChunkedInput {
     struct Chunk {
         int file;
@@ -546,7 +549,8 @@ public:
         const auto available = chunk.file_size - chunk.offset;
         size_t want = std::min<uint64_t>(chunk.size + slack, available);
         for (;;) {
-            if (buffer.size() < want) buffer.resize(want);
+            // Padding lets block scanners load whole 64-byte blocks at the end.
+            if (buffer.size() < want + scan_padding) buffer.resize(want + scan_padding);
             read_exactly(chunk.file, buffer.data(), want, chunk.offset);
             const char* data = buffer.data();
             const char* part_end = data + chunk.size;
@@ -645,6 +649,80 @@ void read_part(Part part, Function&& visit) {
 }
 
 inline bool profile_workers = false;
+
+// Splits the rows of an aligned part whose buffer is readable for
+// scan_padding bytes past its end. Each 64-byte block is classified once;
+// a row's comma positions and quote count accumulate until its newline.
+// The rules match split(): exactly Width - 1 commas, a field may be wrapped
+// in one pair of quotes (which are removed), any other quote makes the row
+// malformed, and the first field must not be empty.
+template <size_t Width, class Function>
+void read_rows(Part part, Function&& visit) {
+#ifdef __AVX2__
+    part = align_part(part);
+    const char* base = part.first;
+    const size_t size = part.end - part.first;
+    std::array<uint32_t, Width> commas{}; // Positions of the row's first commas.
+    size_t comma_count = 0, quote_count = 0, row_start = 0;
+    std::array<std::string_view, Width> fields;
+    auto finish = [&](size_t row_end) {
+        if (comma_count == Width - 1) {
+            size_t start = row_start;
+            size_t accepted = 0;
+            for (size_t column = 0; column < Width; ++column) {
+                const size_t end = column + 1 < Width ? commas[column] : row_end;
+                const size_t length = end - start;
+                size_t quoted = 0;
+                if (length >= 2) quoted = (base[start] == '"') & (base[end - 1] == '"');
+                accepted += 2 * quoted;
+                fields[column] = {base + start + quoted, length - 2 * quoted};
+                start = end + 1;
+            }
+            if (accepted == quote_count && !fields[0].empty()) visit(fields);
+        }
+        comma_count = 0;
+        quote_count = 0;
+        row_start = row_end + 1;
+    };
+    auto take = [&](uint64_t comma_bits, uint64_t quote_bits, size_t block) {
+        quote_count += std::popcount(quote_bits);
+        for (; comma_bits; comma_bits &= comma_bits - 1) {
+            if (comma_count < Width) commas[comma_count] = static_cast<uint32_t>(block + std::countr_zero(comma_bits));
+            ++comma_count;
+        }
+    };
+    const auto comma = _mm256_set1_epi8(',');
+    const auto quote = _mm256_set1_epi8('"');
+    const auto newline = _mm256_set1_epi8('\n');
+    for (size_t block = 0; block < size; block += 64) {
+        const auto low = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + block));
+        const auto high = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(base + block + 32));
+        auto bits = [](__m256i a, __m256i b, __m256i c) {
+            return static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c)))) |
+                   static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, c)))) << 32;
+        };
+        const uint64_t valid = size - block >= 64 ? ~uint64_t{0} : (uint64_t{1} << (size - block)) - 1;
+        uint64_t commas_in = bits(low, high, comma) & valid;
+        uint64_t quotes_in = bits(low, high, quote) & valid;
+        uint64_t lines = bits(low, high, newline) & valid;
+        while (lines) {
+            const auto index = std::countr_zero(lines);
+            const uint64_t before = (uint64_t{1} << index) - 1;
+            take(commas_in & before, quotes_in & before, block);
+            finish(block + index);
+            const uint64_t after = index == 63 ? 0 : ~uint64_t{0} << (index + 1);
+            commas_in &= after;
+            quotes_in &= after;
+            lines &= lines - 1;
+        }
+        take(commas_in, quotes_in, block);
+    }
+    // A final row without a newline ends at the end of the file.
+    if (row_start < size) finish(size);
+#else
+    read_part<Width>(part, visit);
+#endif
+}
 
 template <class Function>
 void parallel(size_t workers, size_t count, Function&& work) {
