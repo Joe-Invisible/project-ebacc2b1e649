@@ -801,8 +801,15 @@ public:
     // the other metrics: the dense array stays in L2, and every session adds
     // to it once per active campaign.
     std::vector<uint32_t> assisted;
+    // Credited sessions per slot, in 16 bytes instead of a full metrics row.
+    struct Credited {
+        uint32_t sessions = 0, purchasing = 0;
+        int64_t revenue = 0;
+    };
+    std::vector<Credited> credited;
 
-    Attribution(size_t campaigns, size_t slots) : counts(campaigns), position(campaigns), assisted(slots) {
+    Attribution(size_t campaigns, size_t slots)
+        : counts(campaigns), position(campaigns), assisted(slots), credited(slots) {
         active.reserve(campaigns);
     }
     void reset() {
@@ -829,10 +836,10 @@ public:
             }
         }
         auto campaign = left < right ? clicks[right - 1].campaign & campaign_mask : counts.size() - 1;
-        auto& credited = daily[base + campaign];
-        ++credited.sessions;
-        credited.purchasing += revenue > 0;
-        credited.revenue += revenue;
+        auto& slot = credited[base + campaign];
+        ++slot.sessions;
+        slot.purchasing += revenue > 0;
+        slot.revenue += revenue;
         for (auto campaign : active) ++assisted[base + campaign];
     }
 };
@@ -1157,7 +1164,14 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot] += campaigns[worker][slot];
     }
     for (size_t worker = 0; worker < workers; ++worker) {
-        for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot].assisted += attribution[worker].assisted[slot];
+        for (size_t slot = 0; slot < campaign_slots; ++slot) {
+            auto& total = campaigns[0][slot];
+            const auto& credited = attribution[worker].credited[slot];
+            total.assisted += attribution[worker].assisted[slot];
+            total.sessions += credited.sessions;
+            total.purchasing += credited.purchasing;
+            total.revenue += credited.revenue;
+        }
     }
     write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
     mark("campaign Parquet");
