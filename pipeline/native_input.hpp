@@ -492,9 +492,18 @@ class ChunkedInput {
     struct Chunk {
         int file;
         uint64_t offset, size, file_size;
+        uint32_t map; // Index into maps.
     };
     std::vector<int> files;
+    std::vector<const char*> maps; // Per file, when mapped loading is on.
     static constexpr size_t slack = 64 * 1024;
+    static bool mapped_loading() {
+        static const bool on = [] {
+            const char* setting = std::getenv("SHOPPING_MAPLOAD");
+            return setting && std::string_view(setting) == "1";
+        }();
+        return on;
+    }
 
     static void read_exactly(int file, char* data, size_t size, uint64_t offset) {
         while (size) {
@@ -529,8 +538,15 @@ public:
             return;
         }
         files.push_back(file);
+        const char* map = nullptr;
+        if (mapped_loading()) {
+            void* memory = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, file, 0);
+            if (memory != MAP_FAILED) map = static_cast<const char*>(memory);
+        }
+        maps.push_back(map);
         for (uint64_t offset = 0; offset < size; offset += chunk_bytes) {
-            chunks.push_back({file, offset, std::min<uint64_t>(chunk_bytes, size - offset), size});
+            chunks.push_back({file, offset, std::min<uint64_t>(chunk_bytes, size - offset), size,
+                              static_cast<uint32_t>(maps.size() - 1)});
         }
     }
 
@@ -553,6 +569,20 @@ public:
     // row. The returned part still needs row alignment, as a mapped one does.
     Part load(size_t index, std::vector<char>& buffer) const {
         const auto& chunk = chunks[index];
+        if (const char* map = maps[chunk.map]) {
+            // The part reads straight from the page cache. Its pages, plus a
+            // little of the next chunk for the last row, get their page table
+            // entries in one call instead of one fault per few pages.
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+            const char* data = map + chunk.offset;
+            const char* file_end = map + chunk.file_size;
+            const auto first = reinterpret_cast<uintptr_t>(data) & ~uintptr_t{4095};
+            const auto last = reinterpret_cast<uintptr_t>(std::min(data + chunk.size + 4096, file_end));
+            madvise(reinterpret_cast<void*>(first), last - first, MADV_POPULATE_READ);
+            return {data, data + chunk.size, file_end};
+        }
         const auto available = chunk.file_size - chunk.offset;
         size_t want = std::min<uint64_t>(chunk.size + slack, available);
         for (;;) {
