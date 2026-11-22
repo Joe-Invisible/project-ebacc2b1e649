@@ -517,6 +517,34 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                 }
             }
             std::vector<char> buffer;
+            auto store_version = [&](bool long_shape, uint64_t id_hash, uint64_t long_id, uint64_t high,
+                                     uint64_t low, uint32_t order, uint32_t position) {
+                if (long_shape) {
+                    long_output[worker][bucket_from_hash<event_bucket_count>(long_id)].push_back(
+                        {long_id, high, low, order, position});
+                } else {
+                    output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back({id_hash, order, position});
+                }
+            };
+            // A valid row whose user ID needs the shared intern table waits here
+            // while that table slot is prefetched; it is stored once its ring
+            // slot is reused, by when the slot is usually cached. Waiting rows
+            // point into the chunk buffer, so each chunk flushes the ring.
+            struct Waiting {
+                bool used = false;
+                bool long_shape = false;
+                Keys::Prepared user{};
+                uint64_t id_hash = 0, long_id = 0, high = 0, low = 0;
+                uint32_t order = 0, offset = 0, purchase = 0;
+            };
+            std::array<Waiting, 8> waiting;
+            size_t wait_at = 0;
+            auto finish = [&](Waiting& w) {
+                const auto position =
+                    payloads.store(worker, {hash_key(keys.resolve(w.user)), w.offset, w.purchase});
+                store_version(w.long_shape, w.id_hash, w.long_id, w.high, w.low, w.order, position);
+                w.used = false;
+            };
             for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
                 read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
                     uint64_t long_id, high, low;
@@ -524,31 +552,40 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                     const auto id_hash = long_shape ? 0 : hash_key(keys.encode(fields[0]));
                     if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
                     const auto ingest = ingest_seconds(fields[3]);
-                    const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
-                    if (order > UINT32_MAX) throw WideEventLayout{};
-                    EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
+                    const auto order64 = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
+                    if (order64 > UINT32_MAX) throw WideEventLayout{};
+                    const auto order = static_cast<uint32_t>(order64);
+                    uint32_t position = missing_payload;
                     auto ts = event_timestamp_ms(fields[2], fields[3], ingest);
                     if (ts && *ts >= start && *ts < end && ingest * 1000 - *ts <= day_ms &&
                         !fields[1].empty() && !fields[5].empty()) {
                         const auto offset = static_cast<uint32_t>(*ts - start);
+                        bool kept = false;
+                        uint32_t purchase = 0;
                         if (fields[4] == "purchase") {
-                            auto price = parse_price(fields[6]);
-                            if (price) {
-                                auto category = dims.products.get(keys.encode(fields[5]), 0);
-                                const auto user_hash = hash_key(keys.encode(fields[1]));
-                                version.position = payloads.store(worker, {user_hash, offset, price | (category << 24)});
+                            if (auto price = parse_price(fields[6])) {
+                                purchase = price | (dims.products.get(keys.encode(fields[5]), 0) << 24);
+                                kept = true;
                             }
                         } else if (fields[4] == "view" || fields[4] == "cart") {
-                            version.position = payloads.store(worker, {hash_key(keys.encode(fields[1])), offset, 0});
+                            kept = true;
+                        }
+                        if (kept) {
+                            const auto user = keys.prepare(fields[1]);
+                            if (!user.key) {
+                                auto& slot = waiting[wait_at++ % waiting.size()];
+                                if (slot.used) finish(slot);
+                                slot = {true, long_shape, user, id_hash, long_id, high, low, order, offset, purchase};
+                                return;
+                            }
+                            position = payloads.store(worker, {hash_key(user.key), offset, purchase});
                         }
                     }
-                    if (long_shape) {
-                        long_output[worker][bucket_from_hash<event_bucket_count>(long_id)].push_back(
-                            {long_id, high, low, version.ingest, version.position});
-                    } else {
-                        output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
-                    }
+                    store_version(long_shape, id_hash, long_id, high, low, order, position);
                 });
+                for (auto& slot : waiting) {
+                    if (slot.used) finish(slot);
+                }
             }
 #ifdef __AVX2__
             for (auto& bucket : output[worker]) bucket.flush_tail();
