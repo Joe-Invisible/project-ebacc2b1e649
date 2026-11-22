@@ -442,15 +442,28 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                 }
             }
             std::vector<char> buffer;
-            for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
-                read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
-                    const auto id_hash = hash_key(keys.encode(fields[0]));
+            // Rows are handled in small batches: every ID lookup in a batch is
+            // hashed and its table slot prefetched before any row needs it.
+            constexpr size_t batch_size = 16;
+            std::array<std::array<std::string_view, 7>, batch_size> batch;
+            std::array<Keys::Prepared, batch_size> event_ids, user_ids;
+            size_t batched = 0;
+            auto flush = [&] {
+                for (size_t row = 0; row < batched; ++row) {
+                    event_ids[row] = keys.prepare(batch[row][0]);
+                    user_ids[row] = keys.prepare(batch[row][1]);
+                }
+                for (size_t row = 0; row < batched; ++row) {
+                    const auto& fields = batch[row];
+                    const auto& event_id = event_ids[row];
+                    const auto& user_id = user_ids[row];
                     if (fields[3].size() != 20) throw std::runtime_error("invalid event ingest_ts");
                     const auto ingest = ingest_seconds(fields[3]);
                     const auto order = static_cast<uint64_t>(ingest) - static_cast<uint64_t>(origin);
                     if (order > UINT32_MAX) throw WideEventLayout{};
-                    EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
                     auto ts = timestamp_ms(fields[2]);
+                    const auto id_hash = hash_key(keys.resolve(event_id));
+                    EventVersion version{id_hash, static_cast<uint32_t>(order), missing_payload};
                     if (ts && *ts >= start && *ts < end && ingest * 1000 - *ts <= day_ms &&
                         !fields[1].empty() && !fields[5].empty()) {
                         const auto offset = static_cast<uint32_t>(*ts - start);
@@ -458,15 +471,24 @@ void read_events(const ChunkedInput& mapped, size_t workers, int64_t start, int6
                             auto price = parse_price(fields[6]);
                             if (price) {
                                 auto category = dims.products.get(keys.encode(fields[5]), 0);
-                                const auto user_hash = hash_key(keys.encode(fields[1]));
+                                const auto user_hash = hash_key(keys.resolve(user_id));
                                 version.position = payloads.store(worker, {user_hash, offset, price | (category << 24)});
                             }
                         } else if (fields[4] == "view" || fields[4] == "cart") {
-                            version.position = payloads.store(worker, {hash_key(keys.encode(fields[1])), offset, 0});
+                            version.position = payloads.store(worker, {hash_key(keys.resolve(user_id)), offset, 0});
                         }
                     }
                     output[worker][bucket_from_hash<event_bucket_count>(id_hash)].push_back(version);
+                }
+                batched = 0;
+            };
+            for (size_t part; (part = next_part.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
+                read_part<7>(mapped.load(part, buffer), [&](const auto& fields) {
+                    batch[batched] = fields;
+                    if (++batched == batch_size) flush();
                 });
+                // The batch points into the chunk buffer, which the next load reuses.
+                flush();
             }
 #ifdef __AVX2__
             for (auto& bucket : output[worker]) bucket.flush_tail();
@@ -564,14 +586,17 @@ void read_clicks(const ChunkedInput& mapped, size_t workers, int64_t start, int6
         for (size_t part; (part = next.fetch_add(1, std::memory_order_relaxed)) < mapped.chunks.size();) {
             read_part<4>(mapped.load(part, buffer), [&](const auto& fields) {
                 if (fields[1].empty() || fields[2].empty()) return;
+                // Start both ID lookups before the timestamp work.
+                const auto click_id = keys.prepare(fields[0]);
+                const auto user_id = keys.prepare(fields[1]);
                 auto ts = timestamp_ms(fields[3]);
                 if (!ts || *ts < start - week_ms || *ts >= end) return;
                 auto campaign = dims.campaigns.get(keys.encode(fields[2]), missing_campaign);
                 if (campaign == missing_campaign) return;
-                const auto hash = hash_key(keys.encode(fields[1]));
+                const auto hash = hash_key(keys.resolve(user_id));
                 const auto bucket = bucket_from_hash<person_bucket_count>(hash);
                 const auto offset = static_cast<uint32_t>(*ts - (start - week_ms));
-                output[worker][bucket].push_back({hash, keys.encode(fields[0]), offset, campaign, 0});
+                output[worker][bucket].push_back({hash, keys.resolve(click_id), offset, campaign, 0});
             });
         }
 #ifdef __AVX2__

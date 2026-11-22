@@ -223,18 +223,33 @@ public:
     }
     Keys(const Keys&) = delete;
 
-    Key encode(std::string_view value) {
-        if (value.empty()) return 0;
-        if (auto key = short_key(value)) return key;
-        if (value.size() > UINT32_MAX) throw std::length_error("ID too long");
-        Packed packed{};
+    // An ID hashed ahead of its lookup, with the table slot prefetched, so
+    // the cache miss overlaps other work on the row.
+    struct Prepared {
+        std::string_view value;
+        Key key; // Final key for empty and short IDs.
         uint64_t tag;
-        if (pack_hex(value, packed)) {
-            tag = hash_packed(packed);
-        } else {
-            tag = hash_text(value);
-        }
-        if (tag == 0 || tag == busy) tag = 1;
+        Packed packed;
+    };
+
+    Prepared prepare(std::string_view value) const {
+        Prepared prepared{value, 0, 0, {}};
+        if (value.empty()) return prepared;
+        if ((prepared.key = short_key(value))) return prepared;
+        prepared.tag = pack_hex(value, prepared.packed) ? hash_packed(prepared.packed) : hash_text(value);
+        if (prepared.tag == 0 || prepared.tag == busy) prepared.tag = 1;
+        __builtin_prefetch(&slots[prepared.tag & mask], 1, 3);
+        return prepared;
+    }
+
+    Key encode(std::string_view value) { return resolve(prepare(value)); }
+
+    Key resolve(const Prepared& prepared) {
+        if (prepared.key || prepared.value.empty()) return prepared.key;
+        const auto value = prepared.value;
+        if (value.size() > UINT32_MAX) throw std::length_error("ID too long");
+        const auto& packed = prepared.packed;
+        const auto tag = prepared.tag;
         size_t slot = tag & mask;
         for (size_t probes = 0; probes < max_probes; ++probes, slot = (slot + 1) & mask) {
             auto& entry = slots[slot];
