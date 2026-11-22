@@ -45,7 +45,15 @@ struct CampaignMetrics {
 
 namespace parquet {
 // File metadata follows parquet-format/src/main/thrift/parquet.thrift.
-// Each flat column has one LZ4_RAW-compressed PLAIN data page per row group.
+// Each flat column has one PLAIN data page per row group, LZ4_RAW compressed
+// unless SHOPPING_PARQUET_LZ4=0 (an experiment switch).
+inline bool compress_pages() {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("SHOPPING_PARQUET_LZ4");
+        return !setting || std::string_view(setting) != "0";
+    }();
+    return enabled;
+}
 enum Physical { integer = 1, bigint = 2, string = 6 };
 enum Annotation { none = -1, utf8 = 0, date = 6 };
 struct Field {
@@ -178,11 +186,15 @@ class File {
                 }
                 source = packed.data();
             }
-            int bound = LZ4_compressBound(payload);
-            if (!bound) throw std::runtime_error("Parquet LZ4 block is too large");
-            compressed.resize(bound);
-            int compressed_size = LZ4_compress_default(source, compressed.data(), payload, bound);
-            if (!compressed_size) throw std::runtime_error("Parquet LZ4 failed");
+            int compressed_size = static_cast<int>(payload);
+            if (compress_pages()) {
+                int bound = LZ4_compressBound(payload);
+                if (!bound) throw std::runtime_error("Parquet LZ4 block is too large");
+                compressed.resize(bound);
+                compressed_size = LZ4_compress_default(source, compressed.data(), payload, bound);
+                if (!compressed_size) throw std::runtime_error("Parquet LZ4 failed");
+                source = compressed.data();
+            }
             Bytes header;
             Compact page{header};
             page.scalar(1, Compact::i32, 0);
@@ -199,7 +211,7 @@ class File {
             group.pages.push_back({offset, static_cast<int64_t>(header.size() + compressed_size),
                                    static_cast<int64_t>(header.size() + payload)});
             write(header);
-            write(std::string_view(compressed.data(), compressed_size));
+            write(std::string_view(source, compressed_size));
             column.definitions.clear();
             column.values.clear();
         }
@@ -267,7 +279,7 @@ public:
                 if (field.nullable) column.number(3);
                 column.array(3, Compact::binary, 1);
                 column.text(field.name);
-                column.scalar(4, Compact::i32, 7); // LZ4_RAW
+                column.scalar(4, Compact::i32, compress_pages() ? 7 : 0); // LZ4_RAW or UNCOMPRESSED
                 column.scalar(5, Compact::i64, group.rows);
                 column.scalar(6, Compact::i64, page.raw_bytes);
                 column.scalar(7, Compact::i64, page.bytes);
