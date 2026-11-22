@@ -817,8 +817,7 @@ public:
         active.clear();
         left = right = 0;
     }
-    void credit(std::span<const TimelineClick> clicks, int64_t ts, size_t base,
-                int64_t revenue, std::vector<CampaignMetrics>& daily) {
+    void credit(std::span<const TimelineClick> clicks, int64_t ts, size_t base, int64_t revenue) {
         while (right < clicks.size() && clicks[right].ts <= ts) {
             auto campaign = clicks[right++].campaign & campaign_mask;
             if (!counts[campaign]++) {
@@ -910,8 +909,7 @@ public:
 
 void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, size_t bucket,
                       const Keys& keys, const Dimensions& dims, int64_t start, int32_t first_day,
-                      Attribution& attribution, parquet::File& users,
-                      std::vector<CampaignMetrics>& campaign_days) {
+                      Attribution& attribution, parquet::File& users) {
     size_t span_count = 0;
     for (const auto& source : sources) span_count += source[bucket].size();
     if (!span_count) return;
@@ -1026,7 +1024,7 @@ void summarize_bucket(TimelineStorage& storage, const SpanPartitions& sources, s
             daily.revenue += revenue;
             attribution.credit(person_clicks, session_start + week_ms,
                                static_cast<size_t>(daily.day - first_day) * dims.campaign_values.size(),
-                               revenue, campaign_days);
+                               revenue);
         };
         if (use_bins) {
             uint32_t session_start = invalid_event, previous = 0;
@@ -1148,24 +1146,22 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
     size_t campaign_slots = day_count * dims.campaign_values.size();
     const auto user_output = output / "user_daily";
     fs::create_directories(user_output);
-    std::vector<std::vector<CampaignMetrics>> campaigns(workers, std::vector<CampaignMetrics>(campaign_slots));
+    // Workers count into their Attribution's dense arrays; one table holds the totals.
+    std::vector<CampaignMetrics> totals(campaign_slots);
     std::vector<Attribution> attribution(workers, Attribution(dims.campaign_values.size(), campaign_slots));
     std::atomic<size_t> next_bucket{0};
     parallel(workers, workers, [&](size_t, size_t worker) {
         parquet::File writer(user_output / ("part-" + std::to_string(worker) + ".parquet"), parquet::user_schema);
         for (size_t bucket; (bucket = next_bucket.fetch_add(1, std::memory_order_relaxed)) < person_bucket_count;) {
             summarize_bucket(storage, spans, bucket, keys, dims, start, first_day,
-                             attribution[worker], writer, campaigns[worker]);
+                             attribution[worker], writer);
         }
         writer.finish();
     });
     mark("sessionize, attribute and write user Parquet");
-    for (size_t worker = 1; worker < workers; ++worker) {
-        for (size_t slot = 0; slot < campaign_slots; ++slot) campaigns[0][slot] += campaigns[worker][slot];
-    }
     for (size_t worker = 0; worker < workers; ++worker) {
         for (size_t slot = 0; slot < campaign_slots; ++slot) {
-            auto& total = campaigns[0][slot];
+            auto& total = totals[slot];
             const auto& credited = attribution[worker].credited[slot];
             total.assisted += attribution[worker].assisted[slot];
             total.sessions += credited.sessions;
@@ -1173,7 +1169,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             total.revenue += credited.revenue;
         }
     }
-    write_campaigns(output, dims.campaign_values, campaigns[0], first_day);
+    write_campaigns(output, dims.campaign_values, totals, first_day);
     mark("campaign Parquet");
     // Process exit frees the remaining pages on one thread. Release the
     // large timelines in parallel first.
