@@ -1093,7 +1093,9 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             if (entry.is_regular_file()) input_bytes += entry.file_size();
         }
     }
-    Keys keys(input_bytes / 40 / 16);
+    size_t key_divisor = 16;
+    if (const char* setting = std::getenv("SHOPPING_KEY_DIV")) key_divisor = std::max<size_t>(1, std::strtoull(setting, nullptr, 10));
+    Keys keys(input_bytes / 40 / key_divisor);
     const auto dims = dimensions(keys, input);
     if (dims.categories.size() > 256) return 10;
     // Campaign numbers share a 32-bit field with a click ID byte.
