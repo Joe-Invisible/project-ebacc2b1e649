@@ -971,8 +971,9 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
         }
         last = now;
     };
-    // Long IDs are interned in a table sized from the input: at most one
-    // distinct long ID per row on average is far more than the data has.
+    // Long IDs are interned in a table sized from the input. About one row
+    // in eight brings a new long ID, so a slot per four rows (rounded up to a
+    // power of two) keeps the table under half full.
     size_t input_bytes = 0;
     for (const char* folder : {"events", "clicks", "links"}) {
         if (!fs::exists(input / folder)) continue;
@@ -980,7 +981,7 @@ int run(const fs::path& input, const fs::path& output, int64_t start, int64_t en
             if (entry.is_regular_file()) input_bytes += entry.file_size();
         }
     }
-    Keys keys(input_bytes / 40 / 4);
+    Keys keys(input_bytes / 40 / 4 / 2);
     const auto dims = dimensions(keys, input);
     if (dims.categories.size() > 256) return 10;
     PersonAliases people;

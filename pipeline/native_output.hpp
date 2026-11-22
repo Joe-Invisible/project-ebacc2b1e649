@@ -294,7 +294,7 @@ public:
 };
 
 inline void append_user(File& writer, const UserDay& row, const Keys& keys, const std::vector<std::string>& categories) {
-    std::array<char, 9> buffer;
+    Keys::Buffer buffer;
     writer.text(0, keys.decode(row.person, buffer));
     writer.value(1, row.day);
     writer.value(2, row.sessions);

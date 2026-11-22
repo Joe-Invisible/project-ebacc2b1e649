@@ -60,13 +60,24 @@ struct InputLayoutLimit {};
 class Keys {
     static constexpr Key external = Key{1} << 63;
     static constexpr uint64_t busy = ~uint64_t{0};
-    struct Slot {
+    // A long ID of one byte plus 32 lowercase hex digits (the generator's
+    // shape) is stored inline as that byte and 16 packed bytes. Any other
+    // long ID points to a length-prefixed copy in a storage chunk.
+    struct alignas(32) Slot {
         std::atomic<uint64_t> tag{0};
-        const char* text = nullptr; // Length-prefixed bytes in a storage chunk.
+        uint64_t head = 0; // hex_form | first byte, or a pointer to the copy.
+        uint64_t high = 0, low = 0;
+    };
+    static constexpr uint64_t hex_form = uint64_t{1} << 63;
+    struct Packed {
+        uint64_t head, high, low;
+        bool hex;
     };
     Slot* slots = nullptr;
     size_t mask = 0;
-    std::atomic<size_t> used{0};
+    // Bounds probing instead of counting entries, which would make every
+    // thread write one shared cache line. Only a nearly full table reaches it.
+    static constexpr size_t max_probes = 4096;
 
     static Key short_key(std::string_view value) {
         if (value.empty() || value.size() > 9) return 0;
@@ -134,6 +145,62 @@ class Keys {
         return text;
     }
 
+    // Packs "<byte><32 lowercase hex digits>" exactly, or reports another shape.
+    static bool pack_hex(std::string_view value, Packed& packed) {
+        if (value.size() != 33) return false;
+        const char* digits = value.data() + 1;
+#ifdef __AVX2__
+        const auto text = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(digits));
+        // Digits '0'-'9' and letters 'a'-'f' only, each mapped to its value.
+        const auto is_digit = _mm256_and_si256(_mm256_cmpgt_epi8(text, _mm256_set1_epi8('0' - 1)),
+                                               _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), text));
+        const auto is_letter = _mm256_and_si256(_mm256_cmpgt_epi8(text, _mm256_set1_epi8('a' - 1)),
+                                                _mm256_cmpgt_epi8(_mm256_set1_epi8('f' + 1), text));
+        if (static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(is_digit, is_letter))) != UINT32_MAX) {
+            return false;
+        }
+        const auto values = _mm256_add_epi8(_mm256_and_si256(text, _mm256_set1_epi8(0x0f)),
+                                            _mm256_and_si256(is_letter, _mm256_set1_epi8(9)));
+        // Each pair of digits becomes one byte: first * 16 + second.
+        const auto pairs = _mm256_maddubs_epi16(values, _mm256_set1_epi16(0x0110));
+        const auto bytes = _mm256_packus_epi16(pairs, pairs); // lanes: [0..7 x], [8..15 x]
+        alignas(32) uint8_t out[32];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out), bytes);
+        uint64_t high, low;
+        std::memcpy(&high, out, 8);
+        std::memcpy(&low, out + 16, 8);
+        packed = {hex_form | static_cast<unsigned char>(value[0]), __builtin_bswap64(high), __builtin_bswap64(low), true};
+        return true;
+#else
+        uint64_t high = 0, low = 0;
+        for (int i = 0; i < 32; ++i) {
+            const auto c = static_cast<unsigned char>(digits[i]);
+            uint64_t nibble;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else return false;
+            (i < 16 ? high : low) = ((i < 16 ? high : low) << 4) | nibble;
+        }
+        packed = {hex_form | static_cast<unsigned char>(value[0]), high, low, true};
+        return true;
+#endif
+    }
+
+    static uint64_t hash_packed(const Packed& packed) {
+        uint64_t hash = (packed.head ^ 0x9e3779b97f4a7c15ULL) * 0xbf58476d1ce4e5b9ULL;
+        hash = (hash ^ packed.high ^ (hash >> 31)) * 0x94d049bb133111ebULL;
+        hash = (hash ^ packed.low ^ (hash >> 29)) * 0xbf58476d1ce4e5b9ULL;
+        return hash ^ (hash >> 32);
+    }
+
+    static std::string_view unpack_hex(const Slot& slot, std::array<char, 40>& buffer) {
+        constexpr char digits[] = "0123456789abcdef";
+        buffer[0] = static_cast<char>(slot.head & 0xff);
+        for (int i = 0; i < 16; ++i) buffer[1 + i] = digits[(slot.high >> (60 - 4 * i)) & 15];
+        for (int i = 0; i < 16; ++i) buffer[17 + i] = digits[(slot.low >> (60 - 4 * i)) & 15];
+        return {buffer.data(), 33};
+    }
+
     static std::string_view text_of(const char* text) {
         uint32_t length;
         std::memcpy(&length, text, sizeof length);
@@ -160,22 +227,29 @@ public:
         if (value.empty()) return 0;
         if (auto key = short_key(value)) return key;
         if (value.size() > UINT32_MAX) throw std::length_error("ID too long");
-        auto tag = hash_text(value);
+        Packed packed{};
+        uint64_t tag;
+        if (pack_hex(value, packed)) {
+            tag = hash_packed(packed);
+        } else {
+            tag = hash_text(value);
+        }
         if (tag == 0 || tag == busy) tag = 1;
-        for (size_t slot = tag & mask;; slot = (slot + 1) & mask) {
+        size_t slot = tag & mask;
+        for (size_t probes = 0; probes < max_probes; ++probes, slot = (slot + 1) & mask) {
             auto& entry = slots[slot];
             auto current = entry.tag.load(std::memory_order_acquire);
-            if (current == 0) {
-                // Keep the table at most half full so probes stay short.
-                if (used.fetch_add(1, std::memory_order_relaxed) >= (mask + 1) / 2) {
-                    throw InputLayoutLimit{};
+            if (current == 0 &&
+                entry.tag.compare_exchange_strong(current, busy, std::memory_order_acquire)) {
+                if (packed.hex) {
+                    entry.head = packed.head;
+                    entry.high = packed.high;
+                    entry.low = packed.low;
+                } else {
+                    entry.head = reinterpret_cast<uint64_t>(store(value));
                 }
-                if (entry.tag.compare_exchange_strong(current, busy, std::memory_order_acquire)) {
-                    entry.text = store(value);
-                    entry.tag.store(tag, std::memory_order_release);
-                    return external | slot;
-                }
-                used.fetch_sub(1, std::memory_order_relaxed);
+                entry.tag.store(tag, std::memory_order_release);
+                return external | slot;
             }
             // Another thread is storing this slot's string. Wait for it.
             while (current == busy) {
@@ -184,12 +258,28 @@ public:
 #endif
                 current = entry.tag.load(std::memory_order_acquire);
             }
-            if (current == tag && text_of(entry.text) == value) return external | slot;
+            if (current != tag) continue;
+            if (packed.hex) {
+                if (entry.head == packed.head && entry.high == packed.high && entry.low == packed.low) {
+                    return external | slot;
+                }
+            } else if (!(entry.head & hex_form) &&
+                       text_of(reinterpret_cast<const char*>(entry.head)) == value) {
+                return external | slot;
+            }
         }
+        throw InputLayoutLimit{};
     }
 
-    std::string_view decode(Key key, std::array<char, 9>& buffer) const {
-        if (key & external) return text_of(slots[key & ~external].text);
+    // Large enough for a short key or an inline long ID.
+    using Buffer = std::array<char, 40>;
+
+    std::string_view decode(Key key, Buffer& buffer) const {
+        if (key & external) {
+            const auto& slot = slots[key & ~external];
+            if (slot.head & hex_form) return unpack_hex(slot, buffer);
+            return text_of(reinterpret_cast<const char*>(slot.head));
+        }
         size_t size = 0;
         for (int shift = 56; shift >= 0; shift -= 7) {
             auto byte = static_cast<char>((key >> shift) & 127);
@@ -201,7 +291,7 @@ public:
 
     bool less(Key a, Key b) const {
         if (!((a | b) & external)) return a < b;
-        std::array<char, 9> x, y;
+        Buffer x, y;
         return decode(a, x).compare(decode(b, y)) < 0;
     }
 };
