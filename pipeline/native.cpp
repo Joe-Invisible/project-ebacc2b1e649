@@ -127,8 +127,7 @@ public:
 #ifdef SHOPPING_PLAIN_STORES
         if (used == capacity) reserve(std::max(rows_per_line, capacity * 2));
         rows[used++] = value;
-        return;
-#endif
+#else
         const auto slot = used % rows_per_line;
         line[slot] = value;
         if (slot + 1 == rows_per_line) {
@@ -139,15 +138,15 @@ public:
             _mm256_stream_si256(destination + 1, _mm256_load_si256(source + 1));
         }
         ++used;
+#endif
     }
 
     void flush_tail() {
-#ifdef SHOPPING_PLAIN_STORES
-        return;
-#endif
+#ifndef SHOPPING_PLAIN_STORES
         if (used > capacity) reserve(used);
         const auto tail = used % rows_per_line;
         if (tail) std::memcpy(rows + used - tail, line, tail * sizeof(T));
+#endif
     }
 
     // Return the pages concurrently with other workers. Freeing would unmap
