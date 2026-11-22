@@ -602,10 +602,117 @@ public:
     }
 };
 
+#if defined(__AVX2__) && defined(__BMI2__)
+// Field-anchored 64-byte windows: every window starts at a field start, so its
+// separators fit one 64-bit mask and fields come out of straight-line bit work.
+// (Idea from the himagna16 entry; written independently.)
+struct Window64 {
+    uint64_t comma, quote, newline;
+};
+__attribute__((always_inline)) inline Window64 window64(const char* p) {
+    const auto a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const auto b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+    auto bits = [&](char c) {
+        const auto v = _mm256_set1_epi8(c);
+        return static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v)))) |
+               static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32;
+    };
+    return {bits(','), bits('"'), bits('\n')};
+}
+
+// Reads Count fields from a window that starts at a field start. The last
+// field ends at the newline when EndsLine, else at a comma; a newline may not
+// come earlier, and with EndsLine every comma comes before the newline and
+// none sits between the last field and it. Quote rules are split()'s: a field
+// may be wrapped in one pair of quotes, which are removed; any other quote, or
+// a lone quote as the whole field, fails. False means the shape does not fit
+// and the caller decides the line byte by byte.
+template <int Count, bool EndsLine>
+__attribute__((always_inline)) inline bool take_fields(const char*& p, std::string_view* out) {
+    const Window64 w = window64(p);
+    uint64_t c = w.comma;
+    uint32_t pos[Count];
+    uint64_t seps = 0;
+    for (int i = 0; i < Count; ++i) {
+        if (EndsLine && i == Count - 1) {
+            pos[i] = static_cast<uint32_t>(std::countr_zero(w.newline));
+            if (pos[i] >= 64 || std::countr_zero(c) < static_cast<int>(pos[i])) return false;
+        } else {
+            pos[i] = static_cast<uint32_t>(std::countr_zero(c));
+            c &= c - 1;
+        }
+        seps |= uint64_t{1} << (pos[i] & 63);
+    }
+    const uint32_t last = pos[Count - 1];
+    if (last >= 64) return false;
+    if (EndsLine && Count > 1 && pos[Count - 2] >= last) return false;
+    const uint64_t upto = last == 63 ? ~uint64_t{0} : (uint64_t{2} << last) - 1; // positions <= last
+    if (!EndsLine && (w.newline & upto)) return false;
+    const uint64_t first = (1 | (seps << 1)) & upto; // each field's first byte (its separator if empty)
+    const uint64_t final_byte = seps >> 1;           // each field's last byte
+    const uint64_t q = w.quote & upto;
+    if ((q & ~(first | final_byte)) | (q & first & final_byte)) return false;
+    const uint64_t at_start = _pext_u64(q, first), at_end = _pext_u64(w.quote << 1, seps);
+    if (at_start != at_end) return false;
+    uint32_t start = 0;
+    for (int i = 0; i < Count; ++i) {
+        const uint32_t quoted = static_cast<uint32_t>(at_start >> i) & 1;
+        out[i] = {p + start + quoted, pos[i] - start - 2 * quoted};
+        start = pos[i] + 1;
+    }
+    p += last + 1;
+    return true;
+}
+
+// The leading two ID fields, together or (when long) one window each.
+__attribute__((always_inline)) inline bool take_ids(const char*& p, std::string_view* out) {
+    const char* cursor = p;
+    if (!take_fields<2, false>(cursor, out)) {
+        cursor = p;
+        if (!take_fields<1, false>(cursor, out) || !take_fields<1, false>(cursor, out + 1)) return false;
+    }
+    p = cursor;
+    return true;
+}
+
+// A line of the usual event (7 fields) or click (4 fields) shape, read through
+// field-anchored windows. Needs 256 readable bytes from p.
+template <size_t Width>
+__attribute__((always_inline)) inline bool window_line(const char* p, std::array<std::string_view, Width>& f,
+                                                       const char*& next) {
+    const char* cursor = p;
+    if (!take_ids(cursor, &f[0])) return false;
+    if constexpr (Width == 7) {
+        if (!take_fields<3, false>(cursor, &f[2]) || !take_fields<2, true>(cursor, &f[5])) return false;
+    } else {
+        if (!take_fields<2, true>(cursor, &f[2])) return false;
+    }
+    if (f[0].empty()) return false;
+    next = cursor;
+    return true;
+}
+#endif
+
 template <size_t Width, class Function>
 void read_part(Part part, Function&& visit) {
     part = align_part(part);
     std::array<std::string_view, Width> fields;
+#if defined(__AVX2__) && defined(__BMI2__)
+    if constexpr (Width == 7 || Width == 4) {
+        while (part.end - part.first >= 256) {
+            const char* next;
+            if (window_line<Width>(part.first, fields, next)) {
+                visit(fields);
+                part.first = next;
+            } else {
+                auto line_end = next_line(part.first, part.end);
+                size_t size = line_end - part.first - (line_end[-1] == '\n');
+                if (split<Width>({part.first, size}, fields)) visit(fields);
+                part.first = line_end;
+            }
+        }
+    }
+#endif
 #ifdef __AVX2__
     if constexpr (Width >= 2) {
         const auto comma = _mm256_set1_epi8(',');
